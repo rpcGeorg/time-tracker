@@ -1,0 +1,1354 @@
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
+import type { Gap, Project, ReportPeriod, Segment, Tab, TileLayout } from './types';
+import { C, PALETTE } from './theme';
+import { fmtClock, fmtDur, nowMinutes, textOn } from './lib/time';
+import { buildReport, PPM } from './lib/report';
+import { aggregate } from './lib/aggregate';
+import { TimePicker } from './components/TimePicker';
+
+interface AppState {
+  projects: Project[];
+  segments: Segment[];
+  activeId: string | null;
+  paused: boolean;
+  pausedPid: string | null;
+  draftCode: string;
+  draftName: string;
+  draftColor: string;
+  tab: Tab;
+  sheetSegId: string | null;
+  draftActivity: string;
+  tileLayout: TileLayout;
+  fillGap: Gap | null;
+  reportPeriod: ReportPeriod;
+  custFrom: string;
+  custTo: string;
+}
+
+const SEED_PROJECTS: Project[] = [
+  { id: 'p1', code: 'EOS-01', name: 'EOS Rollout', color: '#2B5FAE' },
+  { id: 'p2', code: 'E2E-04', name: 'E2E Training', color: '#E8772E' },
+  { id: 'p3', code: 'STG-07', name: 'Stahlgruber CRM', color: '#2E8B3D' },
+  { id: 'p4', code: 'PMO-02', name: 'PMO & Steering', color: '#B6309A' },
+  { id: 'p5', code: 'INT-12', name: 'Intern / Admin', color: '#7B3FB8' },
+  { id: 'p6', code: 'AKQ-05', name: 'Akquise / Angebot', color: '#19B3C6' },
+];
+
+const SEED_SEGMENTS: Segment[] = [
+  { id: 's1', pid: 'p1', start: 8 * 60 + 5, end: 9 * 60 + 20, activity: 'Sprint Planning & Daily' },
+  { id: 's2', pid: 'p3', start: 9 * 60 + 25, end: 10 * 60 + 10, activity: 'CRM Datenmodell Review' },
+  { id: 's3', pid: 'p2', start: 10 * 60 + 35, end: 12 * 60, activity: 'Workshop-Vorbereitung Modul 2' },
+  { id: 's4', pid: 'p1', start: 12 * 60 + 45, end: 14 * 60 + 32, activity: '' },
+];
+
+const STORAGE_KEY = 'rpc-zeiterfassung-v1';
+
+function isoDate(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
+function loadPersisted(): Pick<AppState, 'projects' | 'segments' | 'tileLayout'> | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const data = JSON.parse(raw);
+    if (!Array.isArray(data.projects)) return null;
+    return { projects: data.projects, segments: data.segments ?? [], tileLayout: data.tileLayout ?? 'grid' };
+  } catch {
+    return null;
+  }
+}
+
+function initialState(): AppState {
+  const persisted = loadPersisted();
+  const today = new Date();
+  return {
+    projects: persisted?.projects ?? SEED_PROJECTS,
+    segments: persisted?.segments ?? SEED_SEGMENTS,
+    activeId: null,
+    paused: false,
+    pausedPid: null,
+    draftCode: '',
+    draftName: '',
+    draftColor: PALETTE[0],
+    tab: 'track',
+    sheetSegId: null,
+    draftActivity: '',
+    tileLayout: persisted?.tileLayout ?? 'grid',
+    fillGap: null,
+    reportPeriod: 'heute',
+    custFrom: isoDate(new Date(today.getFullYear(), today.getMonth(), 1)),
+    custTo: isoDate(today),
+  };
+}
+
+type Updater = Partial<AppState> | ((prev: AppState) => Partial<AppState>);
+
+export default function App() {
+  const [state, setStateRaw] = useState<AppState>(initialState);
+  const [vNow, setVNow] = useState<number>(() => nowMinutes());
+  const dragMoved = useRef(false);
+
+  const setState = (updater: Updater) =>
+    setStateRaw((prev) => ({ ...prev, ...(typeof updater === 'function' ? updater(prev) : updater) }));
+
+  // live clock; extend the running booking to "now" each tick (FA-07)
+  useEffect(() => {
+    const tick = () => {
+      const m = nowMinutes();
+      setVNow(m);
+      setStateRaw((prev) =>
+        prev.activeId
+          ? { ...prev, segments: prev.segments.map((g) => (g.id === prev.activeId ? { ...g, end: m } : g)) }
+          : prev,
+      );
+    };
+    const t = setInterval(tick, 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  // persist projects, segments and layout
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify({ projects: state.projects, segments: state.segments, tileLayout: state.tileLayout }),
+      );
+    } catch {
+      /* ignore quota / privacy-mode errors */
+    }
+  }, [state.projects, state.segments, state.tileLayout]);
+
+  const proj = (pid: string) => state.projects.find((p) => p.id === pid);
+
+  // ---------- actions ----------
+  function tapProject(pid: string) {
+    setState((s) => {
+      let segments = s.segments.slice();
+      let sheetSegId = s.sheetSegId;
+      let draftActivity = s.draftActivity;
+      if (s.activeId) {
+        const cur = segments.find((g) => g.id === s.activeId);
+        if (cur && cur.pid === pid) return s; // already running this project
+        segments = segments.map((g) => (g.id === s.activeId ? { ...g, end: vNow } : g));
+        if (cur && cur.end - cur.start >= 1) {
+          sheetSegId = cur.id;
+          draftActivity = cur.activity || '';
+        }
+      }
+      const id = 'u' + Date.now();
+      segments.push({ id, pid, start: vNow, end: vNow, activity: '' });
+      return { segments, activeId: id, paused: false, pausedPid: null, sheetSegId, draftActivity };
+    });
+  }
+
+  function togglePause() {
+    setState((s) => {
+      if (s.activeId) {
+        const segments = s.segments.map((g) => (g.id === s.activeId ? { ...g, end: vNow } : g));
+        const cur = s.segments.find((g) => g.id === s.activeId);
+        return { segments, activeId: null, paused: true, pausedPid: cur ? cur.pid : null };
+      }
+      if (s.paused && s.pausedPid) {
+        const id = 'u' + Date.now();
+        const segments = s.segments.concat([{ id, pid: s.pausedPid, start: vNow, end: vNow, activity: '' }]);
+        return { segments, activeId: id, paused: false, pausedPid: null };
+      }
+      return s;
+    });
+  }
+
+  function endDay() {
+    setState((s) => {
+      let sheetSegId = s.sheetSegId;
+      let draftActivity = s.draftActivity;
+      let segments = s.segments;
+      if (s.activeId) {
+        const cur = s.segments.find((g) => g.id === s.activeId);
+        segments = s.segments.map((g) => (g.id === s.activeId ? { ...g, end: vNow } : g));
+        if (cur && vNow - cur.start >= 1) {
+          sheetSegId = cur.id;
+          draftActivity = cur.activity || '';
+        }
+      }
+      return { segments, activeId: null, paused: false, pausedPid: null, sheetSegId, draftActivity };
+    });
+  }
+
+  function addProject() {
+    setState((s) => {
+      const code = s.draftCode.trim();
+      const name = s.draftName.trim();
+      if (!code || !name) return s;
+      const id = 'p' + Date.now();
+      return {
+        projects: s.projects.concat([{ id, code, name, color: s.draftColor }]),
+        draftCode: '',
+        draftName: '',
+      };
+    });
+  }
+
+  function updateProject(pid: string, field: 'code' | 'name', v: string) {
+    setState((s) => ({ projects: s.projects.map((p) => (p.id === pid ? { ...p, [field]: v } : p)) }));
+  }
+
+  function cycleColor(pid: string) {
+    setState((s) => {
+      const p = s.projects.find((x) => x.id === pid)!;
+      const ni = (PALETTE.indexOf(p.color) + 1) % PALETTE.length;
+      return { projects: s.projects.map((x) => (x.id === pid ? { ...x, color: PALETTE[ni] } : x)) };
+    });
+  }
+
+  function deleteProject(pid: string) {
+    setState((s) => {
+      const cur = s.activeId ? s.segments.find((g) => g.id === s.activeId) : null;
+      const clearActive = !!cur && cur.pid === pid;
+      return {
+        projects: s.projects.filter((p) => p.id !== pid),
+        segments: s.segments.filter((g) => g.pid !== pid),
+        activeId: clearActive ? null : s.activeId,
+        paused: s.pausedPid === pid ? false : s.paused,
+        pausedPid: s.pausedPid === pid ? null : s.pausedPid,
+      };
+    });
+  }
+
+  function openSheet(segId: string) {
+    const seg = state.segments.find((g) => g.id === segId);
+    if (!seg) return;
+    setState({ sheetSegId: segId, draftActivity: seg.activity || '' });
+  }
+  function saveActivity() {
+    setState((s) => ({
+      segments: s.segments.map((g) => (g.id === s.sheetSegId ? { ...g, activity: s.draftActivity } : g)),
+      sheetSegId: null,
+      draftActivity: '',
+    }));
+  }
+  function closeSheet() {
+    setState({ sheetSegId: null, draftActivity: '' });
+  }
+
+  function setTime(edge: 'start' | 'end', total: number) {
+    setState((s) => ({
+      segments: s.segments.map((g) => {
+        if (g.id !== s.sheetSegId) return g;
+        if (edge === 'start') return { ...g, start: Math.max(0, Math.min(total, g.end - 5)) };
+        return { ...g, end: Math.min(24 * 60, Math.max(total, g.start + 5)) };
+      }),
+    }));
+  }
+
+  function startDrag(segId: string, edge: 'start' | 'end', e: React.PointerEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    const startY = e.clientY;
+    const seg0 = state.segments.find((g) => g.id === segId);
+    if (!seg0) return;
+    const orig = edge === 'start' ? seg0.start : seg0.end;
+    dragMoved.current = false;
+    const move = (ev: PointerEvent) => {
+      dragMoved.current = true;
+      const delta = Math.round((ev.clientY - startY) / PPM / 5) * 5;
+      setStateRaw((st) => ({
+        ...st,
+        segments: st.segments.map((g) => {
+          if (g.id !== segId) return g;
+          if (edge === 'start') return { ...g, start: Math.max(0, Math.min(orig + delta, g.end - 5)) };
+          return { ...g, end: Math.min(24 * 60, Math.max(orig + delta, g.start + 5)) };
+        }),
+      }));
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  }
+
+  function openGapFill(start: number, end: number) {
+    setState({ fillGap: { start, end } });
+  }
+  function fillGapWith(pid: string) {
+    setState((s) => {
+      if (!s.fillGap) return s;
+      const id = 'g' + Date.now();
+      return {
+        segments: s.segments.concat([{ id, pid, start: s.fillGap.start, end: s.fillGap.end, activity: '' }]),
+        fillGap: null,
+      };
+    });
+  }
+
+  // ---------- derived ----------
+  const s = state;
+  const isTrack = s.tab === 'track';
+  const isReport = s.tab === 'report';
+  const isAdmin = s.tab === 'admin';
+  const today = new Date();
+  const dateText = today.toLocaleDateString('de-DE', { weekday: 'short', day: 'numeric', month: 'long' });
+  const clockText = fmtClock(vNow);
+
+  const activeSeg = s.activeId ? s.segments.find((g) => g.id === s.activeId) : null;
+  const running = !!activeSeg;
+  const bannerPid = running ? activeSeg!.pid : s.pausedPid;
+  const bannerProj = bannerPid ? proj(bannerPid) : null;
+
+  const totals: Record<string, number> = {};
+  s.projects.forEach((p) => {
+    totals[p.id] = s.segments.filter((g) => g.pid === p.id).reduce((a, g) => a + (g.end - g.start), 0);
+  });
+  const topId = s.projects.slice().sort((a, b) => totals[b.id] - totals[a.id])[0]?.id;
+
+  const sheetSeg = s.sheetSegId ? s.segments.find((g) => g.id === s.sheetSegId) : null;
+  const sheetProj = sheetSeg ? proj(sheetSeg.pid) : null;
+
+  // ---------- render ----------
+  return (
+    <div
+      style={{
+        height: '100vh',
+        display: 'flex',
+        justifyContent: 'center',
+        background: '#DDE3E7',
+        fontFamily: "'Roboto Condensed','Roboto',system-ui,sans-serif",
+        overflow: 'hidden',
+      }}
+    >
+      <div
+        style={{
+          width: '100%',
+          maxWidth: 430,
+          height: '100vh',
+          background: C.lt1,
+          position: 'relative',
+          display: 'flex',
+          flexDirection: 'column',
+          minHeight: 0,
+          boxShadow: '0 0 40px rgba(14,23,33,.14)',
+          overflow: 'hidden',
+        }}
+      >
+        {/* Header */}
+        <header
+          style={{
+            flex: '0 0 auto',
+            padding: '18px 20px 14px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            background: C.lt1,
+            borderBottom: '1px solid #EAEDEF',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 9 }}>
+            <span style={{ fontWeight: 700, fontSize: 22, letterSpacing: '-.5px', color: C.accent1 }}>rpc</span>
+            <span
+              style={{
+                fontSize: 11,
+                letterSpacing: '.14em',
+                textTransform: 'uppercase',
+                color: C.greyFooter,
+                fontWeight: 500,
+              }}
+            >
+              Zeiterfassung
+            </span>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+            {isTrack && (
+              <button
+                type="button"
+                onClick={endDay}
+                disabled={!(running || s.paused)}
+                style={{
+                  flex: '0 0 auto',
+                  padding: '8px 13px',
+                  fontSize: 11,
+                  fontWeight: 700,
+                  letterSpacing: '.08em',
+                  textTransform: 'uppercase',
+                  whiteSpace: 'nowrap',
+                  border: '1px solid ' + (running || s.paused ? C.accent1 : '#D5DBDF'),
+                  color: running || s.paused ? C.accent1 : '#B9C4CB',
+                  background: running || s.paused ? C.lt1 : '#F7F8F9',
+                  cursor: running || s.paused ? 'pointer' : 'default',
+                }}
+              >
+                Tagesende
+              </button>
+            )}
+            <div style={{ textAlign: 'right', lineHeight: 1.2, whiteSpace: 'nowrap' }}>
+              <div style={{ fontSize: 13, fontWeight: 700, color: C.dk1, whiteSpace: 'nowrap' }}>{dateText}</div>
+              <div style={{ fontSize: 11, color: C.greyFooter, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+                {clockText} Uhr
+              </div>
+            </div>
+          </div>
+        </header>
+
+        {/* Body */}
+        <main className="tk-scroll" style={{ flex: '1 1 auto', minHeight: 0, overflowY: 'auto', background: C.lt1 }}>
+          {isTrack && (
+            <TrackView
+              state={s}
+              running={running}
+              activeSeg={activeSeg ?? null}
+              bannerProj={bannerProj ?? null}
+              totals={totals}
+              topId={topId}
+              onTapProject={tapProject}
+              onTogglePause={togglePause}
+              onSetLayout={(l) => setState({ tileLayout: l })}
+            />
+          )}
+
+          {isReport && (
+            <ReportView
+              state={s}
+              vNow={vNow}
+              today={today}
+              clockText={clockText}
+              onSetPeriod={(p) => setState({ reportPeriod: p })}
+              onSetCust={(field, v) => setState({ [field]: v } as Partial<AppState>)}
+              onOpenSheet={openSheet}
+              onOpenGapFill={openGapFill}
+              onStartDrag={startDrag}
+              dragMoved={dragMoved}
+            />
+          )}
+
+          {isAdmin && (
+            <AdminView
+              state={s}
+              totals={totals}
+              onCycleColor={cycleColor}
+              onUpdateProject={updateProject}
+              onDeleteProject={deleteProject}
+              onSetDraft={(field, v) => setState({ [field]: v } as Partial<AppState>)}
+              onAddProject={addProject}
+            />
+          )}
+        </main>
+
+        {/* Bottom nav */}
+        <BottomNav tab={s.tab} onSelect={(t) => setState({ tab: t })} />
+
+        {/* Activity sheet */}
+        {sheetSeg && sheetProj && (
+          <ActivitySheet
+            seg={sheetSeg}
+            project={sheetProj}
+            draftActivity={s.draftActivity}
+            onActivityInput={(v) => setState({ draftActivity: v })}
+            onSetTime={setTime}
+            onSave={saveActivity}
+            onClose={closeSheet}
+          />
+        )}
+
+        {/* Gap-fill picker */}
+        {s.fillGap && (
+          <GapFillSheet
+            gap={s.fillGap}
+            projects={s.projects}
+            onPick={fillGapWith}
+            onCancel={() => setState({ fillGap: null })}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ======================= BUCHUNGEN ======================= */
+function TrackView(props: {
+  state: AppState;
+  running: boolean;
+  activeSeg: Segment | null;
+  bannerProj: Project | null;
+  totals: Record<string, number>;
+  topId: string | undefined;
+  onTapProject: (pid: string) => void;
+  onTogglePause: () => void;
+  onSetLayout: (l: TileLayout) => void;
+}) {
+  const { state: s, running, activeSeg, bannerProj, totals, topId, onTapProject, onTogglePause, onSetLayout } = props;
+
+  // ---- banner ----
+  let bannerBg: string;
+  let bannerBorder = 'none';
+  let bannerLabel: string;
+  let bannerLabelColor: string;
+  let bannerProject: string;
+  let bannerElapsed: string;
+  let bannerDot: CSSProperties;
+  let pauseLabel = '';
+  let pauseStyle: CSSProperties = { display: 'none' };
+  let bannerTextColor: string = C.lt1;
+  let bannerMutedColor = 'rgba(255,255,255,.6)';
+
+  if (running && activeSeg && bannerProj) {
+    bannerBg = bannerProj.color;
+    bannerLabel = 'Läuft';
+    bannerLabelColor = 'rgba(255,255,255,.85)';
+    bannerProject = bannerProj.code + '  ·  ' + bannerProj.name;
+    bannerElapsed = fmtDur(activeSeg.end - activeSeg.start);
+    bannerDot = { width: 8, height: 8, borderRadius: '50%', background: C.lt1, animation: 'tkPulse 1.4s ease-in-out infinite' };
+    pauseLabel = 'Pause';
+    pauseStyle = {
+      marginTop: 14,
+      width: '100%',
+      padding: 11,
+      background: 'rgba(255,255,255,.16)',
+      color: C.lt1,
+      fontSize: 13,
+      fontWeight: 700,
+      letterSpacing: '.06em',
+      textTransform: 'uppercase',
+    };
+  } else if (s.paused && bannerProj) {
+    bannerBg = C.dk1;
+    bannerLabel = 'Pausiert';
+    bannerLabelColor = 'rgba(255,255,255,.7)';
+    bannerProject = bannerProj.code + '  ·  ' + bannerProj.name;
+    const segp = s.segments.filter((g) => g.pid === bannerProj.id).reduce((a, g) => a + (g.end - g.start), 0);
+    bannerElapsed = fmtDur(segp);
+    bannerDot = { width: 8, height: 8, borderRadius: '50%', background: C.accent3_60 };
+    pauseLabel = 'Fortsetzen';
+    pauseStyle = {
+      marginTop: 14,
+      width: '100%',
+      padding: 11,
+      background: C.accent3,
+      color: C.lt1,
+      fontSize: 13,
+      fontWeight: 700,
+      letterSpacing: '.06em',
+      textTransform: 'uppercase',
+    };
+  } else {
+    bannerBg = C.lt2;
+    bannerBorder = '1px dashed #B9C4CB';
+    bannerLabel = 'Keine Erfassung';
+    bannerLabelColor = C.greyFooter;
+    bannerProject = 'Kein Projekt aktiv';
+    bannerElapsed = '0:00';
+    bannerTextColor = C.dk1;
+    bannerMutedColor = '#B9C4CB';
+    bannerDot = { width: 8, height: 8, borderRadius: '50%', background: '#B9C4CB' };
+  }
+
+  const layout = s.tileLayout;
+  const layoutDefs: [TileLayout, string, string][] = [
+    ['grid', '▦', 'Raster'],
+    ['sized', '▤', 'Gewichtet'],
+    ['list', '☰', 'Liste'],
+  ];
+
+  const trackHint = running
+    ? 'Tippe ein anderes Projekt, um zu wechseln – die laufende Buchung wird gestoppt und du erfasst die Tätigkeit.'
+    : s.paused
+      ? 'Erfassung pausiert. Tippe „Fortsetzen“ oder wähle direkt ein Projekt.'
+      : 'Tippe eine Projekt-Kachel, um die Zeiterfassung zu starten.';
+
+  const tileWrap: CSSProperties =
+    layout === 'list'
+      ? { display: 'flex', flexDirection: 'column', gap: 0, padding: '0 20px' }
+      : { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 0, padding: '0 20px' };
+
+  return (
+    <section>
+      {/* status banner */}
+      <div style={{ margin: '16px 20px 0', padding: '16px 18px', background: bannerBg, border: bannerBorder }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 14 }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={bannerDot} />
+              <span
+                style={{
+                  fontSize: 11,
+                  letterSpacing: '.14em',
+                  textTransform: 'uppercase',
+                  fontWeight: 700,
+                  whiteSpace: 'nowrap',
+                  color: bannerLabelColor,
+                }}
+              >
+                {bannerLabel}
+              </span>
+            </div>
+            <div
+              style={{
+                fontSize: 19,
+                fontWeight: 700,
+                color: bannerTextColor,
+                marginTop: 4,
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+              }}
+            >
+              {bannerProject}
+            </div>
+          </div>
+          <div style={{ textAlign: 'right', flex: '0 0 auto' }}>
+            <div style={{ fontSize: 34, fontWeight: 300, color: bannerTextColor, fontVariantNumeric: 'tabular-nums', lineHeight: 1 }}>
+              {bannerElapsed}
+            </div>
+            <div style={{ fontSize: 10, letterSpacing: '.12em', textTransform: 'uppercase', color: bannerMutedColor }}>
+              Std : Min
+            </div>
+          </div>
+        </div>
+        {pauseStyle.display !== 'none' && (
+          <button type="button" onClick={onTogglePause} style={pauseStyle}>
+            {pauseLabel}
+          </button>
+        )}
+      </div>
+
+      {/* layout switcher */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 20px 10px' }}>
+        <span style={{ fontSize: 11, letterSpacing: '.14em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700 }}>
+          Projekte
+        </span>
+        <div style={{ display: 'flex', border: '1px solid #D5DBDF', background: C.lt2 }}>
+          {layoutDefs.map(([k, icon, title]) => (
+            <button
+              key={k}
+              type="button"
+              title={title}
+              onClick={() => onSetLayout(k)}
+              style={{
+                padding: '7px 12px',
+                fontSize: 14,
+                color: layout === k ? C.lt1 : C.greyFooter,
+                background: layout === k ? C.accent1 : 'transparent',
+              }}
+            >
+              {icon}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* tiles */}
+      <div style={tileWrap}>
+        {s.projects.map((p) => {
+          const isActive = running && activeSeg!.pid === p.id;
+          const isPaused = s.paused && s.pausedPid === p.id;
+          const tc = textOn(p.color);
+          const tot = totals[p.id];
+          const metaText = tot > 0 ? fmtDur(tot) + ' h' : '–';
+          const ring: CSSProperties = isActive
+            ? { boxShadow: 'inset 0 0 0 3px #FEFFFF, inset 0 0 0 5px ' + p.color }
+            : isPaused
+              ? { boxShadow: 'inset 0 0 0 2px #7BBEE0' }
+              : {};
+
+          if (layout === 'list') {
+            return (
+              <button
+                key={p.id}
+                type="button"
+                onClick={() => onTapProject(p.id)}
+                style={{
+                  position: 'relative',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 14,
+                  padding: '15px 16px',
+                  background: p.color,
+                  color: tc,
+                  borderBottom: '1px solid rgba(255,255,255,.14)',
+                  ...ring,
+                }}
+              >
+                {isActive && (
+                  <span style={{ width: 9, height: 9, borderRadius: '50%', background: tc, animation: 'tkPulse 1.4s infinite' }} />
+                )}
+                <span style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 0, textAlign: 'left' }}>
+                  <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: '.12em', textTransform: 'uppercase', opacity: 0.7, color: tc }}>
+                    {p.code}
+                  </span>
+                  <span style={{ fontSize: 16, fontWeight: 700, color: tc, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {p.name}
+                  </span>
+                </span>
+                <span style={{ marginLeft: 'auto', fontSize: 14, fontWeight: 300, fontVariantNumeric: 'tabular-nums', color: tc, opacity: 0.9 }}>
+                  {metaText}
+                </span>
+              </button>
+            );
+          }
+
+          const big = layout === 'sized' && p.id === topId;
+          return (
+            <button
+              key={p.id}
+              type="button"
+              onClick={() => onTapProject(p.id)}
+              style={{
+                position: 'relative',
+                display: 'flex',
+                flexDirection: 'column',
+                justifyContent: 'space-between',
+                alignItems: 'flex-start',
+                padding: '14px 15px',
+                background: p.color,
+                color: tc,
+                outline: '1px solid rgba(255,255,255,.16)',
+                outlineOffset: '-0.5px',
+                gridColumn: big ? 'span 2' : undefined,
+                minHeight: big ? 108 : 128,
+                ...ring,
+              }}
+            >
+              {isActive && (
+                <span
+                  style={{ position: 'absolute', top: 14, right: 14, width: 9, height: 9, borderRadius: '50%', background: tc, animation: 'tkPulse 1.4s infinite' }}
+                />
+              )}
+              <span style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 0, textAlign: 'left' }}>
+                <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: '.1em', textTransform: 'uppercase', opacity: 0.72, color: tc }}>
+                  {p.code}
+                </span>
+                <span style={{ fontSize: big ? 19 : 16, fontWeight: 700, color: tc, lineHeight: 1.12 }}>{p.name}</span>
+              </span>
+              <span style={{ fontSize: 13, fontWeight: 300, fontVariantNumeric: 'tabular-nums', color: tc, opacity: 0.9 }}>
+                {metaText}
+              </span>
+            </button>
+          );
+        })}
+      </div>
+
+      <div style={{ padding: '6px 20px 30px' }}>
+        <p style={{ fontSize: 12, lineHeight: 1.5, color: C.greyFooter, margin: 0 }}>{trackHint}</p>
+      </div>
+    </section>
+  );
+}
+
+/* ======================= REPORTING ======================= */
+function ReportView(props: {
+  state: AppState;
+  vNow: number;
+  today: Date;
+  clockText: string;
+  onSetPeriod: (p: ReportPeriod) => void;
+  onSetCust: (field: 'custFrom' | 'custTo', v: string) => void;
+  onOpenSheet: (segId: string) => void;
+  onOpenGapFill: (start: number, end: number) => void;
+  onStartDrag: (segId: string, edge: 'start' | 'end', e: React.PointerEvent) => void;
+  dragMoved: React.MutableRefObject<boolean>;
+}) {
+  const { state: s, vNow, today, clockText, onSetPeriod, onSetCust, onOpenSheet, onOpenGapFill, onStartDrag, dragMoved } = props;
+  const period = s.reportPeriod;
+  const showTimeline = period === 'heute';
+  const showCust = period === 'zeitraum';
+
+  const periodDefs: [ReportPeriod, string][] = [
+    ['heute', 'Heute'],
+    ['woche', 'Woche'],
+    ['monat', 'Monat'],
+    ['jahr', 'Jahr'],
+    ['zeitraum', 'Zeitraum'],
+  ];
+
+  const rep = showTimeline
+    ? buildReport({ projects: s.projects, segments: s.segments, activeId: s.activeId, vNow, date: today })
+    : null;
+  const agg = !showTimeline
+    ? aggregate({ projects: s.projects, period, custFrom: s.custFrom, custTo: s.custTo, today })
+    : null;
+
+  const hatch = 'repeating-linear-gradient(135deg,#F3F4F4,#F3F4F4 7px,#E8ECEE 7px,#E8ECEE 14px)';
+
+  return (
+    <section style={{ padding: '18px 20px 36px' }}>
+      <div style={{ display: 'flex', border: '1px solid #D5DBDF', background: C.lt2, marginBottom: 20, overflow: 'hidden' }}>
+        {periodDefs.map(([k, label]) => (
+          <button
+            key={k}
+            type="button"
+            onClick={() => onSetPeriod(k)}
+            style={{
+              flex: '1 1 auto',
+              padding: '9px 4px',
+              fontSize: 12,
+              fontWeight: 700,
+              letterSpacing: '.02em',
+              textAlign: 'center',
+              whiteSpace: 'nowrap',
+              color: period === k ? C.lt1 : '#5E7184',
+              background: period === k ? C.accent1 : 'transparent',
+            }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {/* ---- Tagesansicht (timeline) ---- */}
+      {rep && (
+        <>
+          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 14 }}>
+            <div>
+              <div style={{ fontSize: 11, letterSpacing: '.14em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700, whiteSpace: 'nowrap' }}>
+                Chronologisch · Heute
+              </div>
+              <div style={{ fontSize: 13, color: C.greyFooter, marginTop: 3 }}>{rep.reportDate}</div>
+            </div>
+            <div style={{ textAlign: 'right', flex: '0 0 auto' }}>
+              <div style={{ fontSize: 28, fontWeight: 300, color: C.accent1, fontVariantNumeric: 'tabular-nums', lineHeight: 1 }}>
+                {rep.reportTotal}
+              </div>
+              <div style={{ fontSize: 10, letterSpacing: '.1em', textTransform: 'uppercase', color: C.greyFooter }}>Std erfasst</div>
+            </div>
+          </div>
+
+          <div style={{ display: 'flex', height: 10, margin: '16px 0 12px', background: C.lt2, overflow: 'hidden' }}>
+            {rep.shareSegments.map((sh) => (
+              <div key={sh.pid} style={{ width: sh.widthPct + '%', background: sh.color }} />
+            ))}
+          </div>
+
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px 16px', marginBottom: 20 }}>
+            {rep.legend.map((lg) => (
+              <div key={lg.pid} style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
+                <span style={{ width: 10, height: 10, background: lg.color, flex: '0 0 auto' }} />
+                <span style={{ fontSize: 12, color: C.dk1, fontWeight: 500 }}>{lg.name}</span>
+                <span style={{ fontSize: 12, color: C.greyFooter, fontVariantNumeric: 'tabular-nums' }}>{lg.dur}</span>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ fontSize: 11, lineHeight: 1.5, color: C.muted, marginBottom: 12 }}>
+            Ziehe die Ränder einer Buchung, um Start &amp; Ende anzupassen · tippe eine Lücke, um sie zu füllen · tippe eine Buchung, um die
+            Tätigkeit zu bearbeiten
+          </div>
+
+          <div style={{ position: 'relative', height: rep.timelineHeight }}>
+            {rep.hourMarks.map((hm) => (
+              <div key={hm.hour}>
+                <div style={{ position: 'absolute', left: 48, right: 0, top: hm.top, borderTop: '1px solid #EDF0F1' }} />
+                <div
+                  style={{
+                    position: 'absolute',
+                    left: 0,
+                    top: hm.top - 7,
+                    width: 42,
+                    textAlign: 'right',
+                    fontSize: 11,
+                    color: C.muted,
+                    fontVariantNumeric: 'tabular-nums',
+                  }}
+                >
+                  {hm.label}
+                </div>
+              </div>
+            ))}
+            <div style={{ position: 'absolute', top: 0, bottom: 0, left: 48, right: 2 }}>
+              {rep.gaps.map((g) => (
+                <button
+                  key={g.start + '-' + g.end}
+                  type="button"
+                  onClick={() => onOpenGapFill(g.start, g.end)}
+                  style={{
+                    position: 'absolute',
+                    top: g.top,
+                    height: g.height - 2,
+                    left: 0,
+                    right: 0,
+                    background: hatch,
+                    border: '1px dashed #B9C4CB',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    color: C.accent2,
+                  }}
+                >
+                  <span style={{ fontSize: 11, color: C.accent2, fontWeight: 700 }}>+ Lücke füllen · {g.label}</span>
+                </button>
+              ))}
+              {rep.blocks.map((b) => {
+                const grip: CSSProperties = { width: 32, height: 4, borderRadius: 2, background: b.textColor, opacity: 0.8, pointerEvents: 'none' };
+                const handleBase: CSSProperties = {
+                  position: 'absolute',
+                  left: 0,
+                  right: 0,
+                  height: 16,
+                  display: b.showHandles ? 'flex' : 'none',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  cursor: 'ns-resize',
+                  touchAction: 'none',
+                  zIndex: 2,
+                };
+                return (
+                  <div
+                    key={b.id}
+                    onClick={() => {
+                      if (dragMoved.current) {
+                        dragMoved.current = false;
+                        return;
+                      }
+                      onOpenSheet(b.id);
+                    }}
+                    style={{
+                      position: 'absolute',
+                      top: b.top,
+                      height: b.height - 2,
+                      left: 'calc(' + b.leftPct + '% + 2px)',
+                      width: 'calc(' + b.widthPct + '% - 4px)',
+                      background: b.color,
+                      color: b.textColor,
+                      padding: b.tightPad ? '3px 9px' : '8px 9px',
+                      overflow: 'hidden',
+                      cursor: 'pointer',
+                      outline: b.isRun ? '2px solid #FEFFFF' : undefined,
+                      outlineOffset: b.isRun ? -3 : undefined,
+                    }}
+                  >
+                    <span onPointerDown={(e) => onStartDrag(b.id, 'start', e)} style={{ ...handleBase, top: -2 }}>
+                      <span style={grip} />
+                    </span>
+                    {b.showCode && (
+                      <span
+                        style={{
+                          display: 'block',
+                          fontSize: 11,
+                          fontWeight: 700,
+                          letterSpacing: '.06em',
+                          color: b.textColor,
+                          opacity: 0.85,
+                          whiteSpace: 'nowrap',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                        }}
+                      >
+                        {b.code}
+                      </span>
+                    )}
+                    {b.showRange && (
+                      <span
+                        style={{
+                          display: 'block',
+                          fontSize: 12,
+                          fontWeight: 500,
+                          color: b.textColor,
+                          fontVariantNumeric: 'tabular-nums',
+                          marginTop: 2,
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {b.rangeText}
+                      </span>
+                    )}
+                    {b.showAct && (
+                      <span
+                        style={{
+                          display: '-webkit-box',
+                          WebkitLineClamp: 2,
+                          WebkitBoxOrient: 'vertical',
+                          overflow: 'hidden',
+                          fontSize: 11,
+                          lineHeight: 1.32,
+                          fontWeight: 400,
+                          color: b.textColor,
+                          opacity: 0.82,
+                          marginTop: 4,
+                        }}
+                      >
+                        {b.activity}
+                      </span>
+                    )}
+                    <span onPointerDown={(e) => onStartDrag(b.id, 'end', e)} style={{ ...handleBase, bottom: -2 }}>
+                      <span style={grip} />
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{ position: 'absolute', left: 48, right: 0, top: rep.nowTop, borderTop: '2px dashed #0E1721', pointerEvents: 'none' }} />
+            <div
+              style={{
+                position: 'absolute',
+                right: 0,
+                top: rep.nowTop + 4,
+                fontSize: 10,
+                fontWeight: 700,
+                letterSpacing: '.06em',
+                textTransform: 'uppercase',
+                color: C.dk1,
+                pointerEvents: 'none',
+              }}
+            >
+              jetzt {clockText}
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* ---- aggregierte Auswertung ---- */}
+      {agg && (
+        <>
+          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 14 }}>
+            <div>
+              <div style={{ fontSize: 11, letterSpacing: '.14em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700, whiteSpace: 'nowrap' }}>
+                Auswertung
+              </div>
+              <div style={{ fontSize: 13, color: C.greyFooter, marginTop: 3 }}>{agg.rangeLabel}</div>
+            </div>
+            <div style={{ textAlign: 'right', flex: '0 0 auto' }}>
+              <div style={{ fontSize: 28, fontWeight: 300, color: C.accent1, fontVariantNumeric: 'tabular-nums', lineHeight: 1 }}>
+                {agg.totalText}
+              </div>
+              <div style={{ fontSize: 10, letterSpacing: '.1em', textTransform: 'uppercase', color: C.greyFooter }}>Std gesamt</div>
+            </div>
+          </div>
+
+          {showCust && (
+            <div style={{ display: 'flex', gap: 10, marginTop: 14 }}>
+              <div style={{ flex: 1 }}>
+                <label style={{ display: 'block', fontSize: 10, letterSpacing: '.08em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700, marginBottom: 5 }}>
+                  Von
+                </label>
+                <input
+                  type="date"
+                  value={s.custFrom}
+                  onChange={(e) => onSetCust('custFrom', e.target.value)}
+                  style={{ width: '100%', border: '1px solid #D5DBDF', padding: '9px 11px', fontSize: 13, color: C.dk1, outline: 'none', background: C.lt2 }}
+                />
+              </div>
+              <div style={{ flex: 1 }}>
+                <label style={{ display: 'block', fontSize: 10, letterSpacing: '.08em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700, marginBottom: 5 }}>
+                  Bis
+                </label>
+                <input
+                  type="date"
+                  value={s.custTo}
+                  onChange={(e) => onSetCust('custTo', e.target.value)}
+                  style={{ width: '100%', border: '1px solid #D5DBDF', padding: '9px 11px', fontSize: 13, color: C.dk1, outline: 'none', background: C.lt2 }}
+                />
+              </div>
+            </div>
+          )}
+
+          <div style={{ display: 'flex', height: 10, margin: '16px 0 22px', background: C.lt2, overflow: 'hidden' }}>
+            {agg.shareSegments.map((sh) => (
+              <div key={sh.pid} style={{ width: sh.widthPct + '%', background: sh.color }} />
+            ))}
+          </div>
+
+          <div style={{ fontSize: 11, letterSpacing: '.12em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700, marginBottom: 12 }}>
+            Verlauf
+          </div>
+          <div style={{ display: 'flex', alignItems: 'flex-end', gap: 5, height: 140, paddingBottom: 2, marginBottom: 24, borderBottom: '1px solid #EDF0F1' }}>
+            {agg.columnBuckets.map((cb, i) => (
+              <div key={i} style={{ flex: '1 1 0', minWidth: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 6 }}>
+                <div style={{ width: '62%', minWidth: 7, maxWidth: 30, height: cb.colHeight, display: 'flex', flexDirection: 'column', justifyContent: 'flex-end' }}>
+                  {cb.segments.map((sg, j) => (
+                    <div key={j} style={{ width: '100%', height: sg.heightPx, background: sg.color }} />
+                  ))}
+                </div>
+                <div style={{ fontSize: 9, color: C.muted, whiteSpace: 'nowrap' }}>{cb.label}</div>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ fontSize: 11, letterSpacing: '.12em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700, marginBottom: 14 }}>
+            Nach Projekt
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+            {agg.rankedBars.map((rb) => (
+              <div key={rb.pid}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                  <span style={{ width: 10, height: 10, flex: '0 0 auto', background: rb.color }} />
+                  <span style={{ fontSize: 14, fontWeight: 700, color: C.dk1 }}>{rb.name}</span>
+                  <span style={{ marginLeft: 'auto', fontSize: 13, fontWeight: 700, color: C.dk1, fontVariantNumeric: 'tabular-nums' }}>
+                    {rb.durText}
+                  </span>
+                  <span style={{ fontSize: 12, color: C.muted, width: 38, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{rb.pctText}</span>
+                </div>
+                <div style={{ flex: '1 1 auto', height: 8, background: '#F0F2F3', position: 'relative' }}>
+                  <div style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: rb.fillPct + '%', background: rb.color }} />
+                </div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </section>
+  );
+}
+
+/* ======================= PFLEGE ======================= */
+function AdminView(props: {
+  state: AppState;
+  totals: Record<string, number>;
+  onCycleColor: (pid: string) => void;
+  onUpdateProject: (pid: string, field: 'code' | 'name', v: string) => void;
+  onDeleteProject: (pid: string) => void;
+  onSetDraft: (field: 'draftCode' | 'draftName' | 'draftColor', v: string) => void;
+  onAddProject: () => void;
+}) {
+  const { state: s, totals, onCycleColor, onUpdateProject, onDeleteProject, onSetDraft, onAddProject } = props;
+  const canAdd = !!(s.draftCode.trim() && s.draftName.trim());
+
+  return (
+    <section style={{ padding: '18px 20px 36px' }}>
+      <div style={{ fontSize: 11, letterSpacing: '.14em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700, marginBottom: 4 }}>
+        Projekte verwalten
+      </div>
+      <p style={{ fontSize: 12, lineHeight: 1.5, color: C.greyFooter, margin: '0 0 18px' }}>
+        Code &amp; Name bearbeiten, Farbe per Tipp auf die Kachel wechseln. Jedes Projekt erscheint als Kachel in der Buchung.
+      </p>
+
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+        {s.projects.map((p) => {
+          const used = totals[p.id] > 0;
+          return (
+            <div key={p.id} style={{ display: 'flex', alignItems: 'stretch', border: '1px solid #E1E5E8', background: C.lt1 }}>
+              <button type="button" title="Farbe wechseln" onClick={() => onCycleColor(p.id)} style={{ flex: '0 0 auto', width: 40, height: 40, background: p.color }} />
+              <div style={{ flex: '1 1 auto', minWidth: 0, padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 2 }}>
+                <input
+                  value={p.code}
+                  onChange={(e) => onUpdateProject(p.id, 'code', e.target.value)}
+                  style={{ border: 'none', outline: 'none', padding: 0, fontSize: 11, fontWeight: 700, letterSpacing: '.1em', textTransform: 'uppercase', color: C.greyFooter, background: 'transparent' }}
+                />
+                <input
+                  value={p.name}
+                  onChange={(e) => onUpdateProject(p.id, 'name', e.target.value)}
+                  style={{ border: 'none', outline: 'none', padding: 0, fontSize: 16, fontWeight: 700, color: C.dk1, background: 'transparent' }}
+                />
+                <span style={{ fontSize: 11, color: C.muted }}>{used ? fmtDur(totals[p.id]) + ' h heute' : 'noch keine Zeit'}</span>
+              </div>
+              <button type="button" title="Löschen" onClick={() => onDeleteProject(p.id)} style={{ flex: '0 0 auto', width: 46, color: C.muted, fontSize: 18 }}>
+                ×
+              </button>
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{ marginTop: 24, borderTop: '2px solid #074771', paddingTop: 18 }}>
+        <div style={{ fontSize: 11, letterSpacing: '.14em', textTransform: 'uppercase', color: C.accent1, fontWeight: 700, marginBottom: 14 }}>
+          Neues Projekt anlegen
+        </div>
+        <div style={{ display: 'flex', gap: 10 }}>
+          <div style={{ flex: '0 0 116px' }}>
+            <label style={{ display: 'block', fontSize: 11, letterSpacing: '.08em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700, marginBottom: 5 }}>
+              Code
+            </label>
+            <input
+              value={s.draftCode}
+              onChange={(e) => onSetDraft('draftCode', e.target.value)}
+              placeholder="z. B. NEU-01"
+              style={{ width: '100%', border: '1px solid #D5DBDF', padding: '11px 12px', fontSize: 14, color: C.dk1, outline: 'none', background: C.lt2 }}
+            />
+          </div>
+          <div style={{ flex: '1 1 auto', minWidth: 0 }}>
+            <label style={{ display: 'block', fontSize: 11, letterSpacing: '.08em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700, marginBottom: 5 }}>
+              Name
+            </label>
+            <input
+              value={s.draftName}
+              onChange={(e) => onSetDraft('draftName', e.target.value)}
+              placeholder="Projektbezeichnung"
+              style={{ width: '100%', border: '1px solid #D5DBDF', padding: '11px 12px', fontSize: 14, color: C.dk1, outline: 'none', background: C.lt2 }}
+            />
+          </div>
+        </div>
+        <label style={{ display: 'block', fontSize: 11, letterSpacing: '.08em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700, margin: '16px 0 8px' }}>
+          Farbe
+        </label>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          {PALETTE.map((c) => (
+            <button
+              key={c}
+              type="button"
+              onClick={() => onSetDraft('draftColor', c)}
+              style={{ width: 30, height: 30, background: c, outline: s.draftColor === c ? '3px solid #0E1721' : '1px solid rgba(0,0,0,.08)', outlineOffset: -1 }}
+            />
+          ))}
+        </div>
+        <button
+          type="button"
+          onClick={onAddProject}
+          disabled={!canAdd}
+          style={{
+            width: '100%',
+            marginTop: 14,
+            padding: 14,
+            background: canAdd ? C.accent1 : '#C7CFD4',
+            color: C.lt1,
+            fontSize: 14,
+            fontWeight: 700,
+            letterSpacing: '.04em',
+            cursor: canAdd ? 'pointer' : 'not-allowed',
+          }}
+        >
+          Projekt anlegen
+        </button>
+      </div>
+    </section>
+  );
+}
+
+/* ======================= BOTTOM NAV ======================= */
+function BottomNav({ tab, onSelect }: { tab: Tab; onSelect: (t: Tab) => void }) {
+  const wrench = (
+    <svg width={19} height={19} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" style={{ display: 'block' }}>
+      <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
+    </svg>
+  );
+  const items: [Tab, string, React.ReactNode][] = [
+    ['track', 'Buchungen', '▣'],
+    ['report', 'Reporting', '▥'],
+    ['admin', 'Pflege', wrench],
+  ];
+  return (
+    <nav style={{ flex: '0 0 auto', display: 'flex', background: C.lt1, borderTop: '1px solid #EAEDEF' }}>
+      {items.map(([k, label, icon]) => {
+        const on = tab === k;
+        return (
+          <button
+            key={k}
+            type="button"
+            onClick={() => onSelect(k)}
+            style={{
+              flex: 1,
+              position: 'relative',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              gap: 3,
+              padding: '11px 0 13px',
+              color: on ? C.accent1 : C.muted,
+              background: C.lt1,
+            }}
+          >
+            <span style={{ position: 'absolute', top: 0, left: 0, right: 0, height: 3, background: on ? C.accent1 : 'transparent' }} />
+            <span style={{ fontSize: 19, lineHeight: 1 }}>{icon}</span>
+            <span style={{ fontSize: 11, fontWeight: 700, letterSpacing: '.04em' }}>{label}</span>
+          </button>
+        );
+      })}
+    </nav>
+  );
+}
+
+/* ======================= ACTIVITY SHEET ======================= */
+function ActivitySheet(props: {
+  seg: Segment;
+  project: Project;
+  draftActivity: string;
+  onActivityInput: (v: string) => void;
+  onSetTime: (edge: 'start' | 'end', total: number) => void;
+  onSave: () => void;
+  onClose: () => void;
+}) {
+  const { seg, project, draftActivity, onActivityInput, onSetTime, onSave, onClose } = props;
+  const tc = textOn(project.color);
+  const dark = tc === C.dk1;
+  const muted = dark ? 'rgba(14,23,33,.6)' : 'rgba(255,255,255,.72)';
+  const grab = dark ? 'rgba(14,23,33,.22)' : 'rgba(255,255,255,.45)';
+  const range = fmtClock(seg.start) + '–' + fmtClock(seg.end) + ' (' + fmtDur(seg.end - seg.start) + ' h)';
+
+  return (
+    <div
+      onClick={onClose}
+      style={{ position: 'absolute', inset: 0, background: 'rgba(14,23,33,.4)', zIndex: 30, display: 'flex', alignItems: 'flex-end', animation: 'tkFade .18s ease' }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: '100%', background: C.lt1, animation: 'tkRise .26s cubic-bezier(.16,.84,.44,1)', boxShadow: '0 -8px 30px rgba(14,23,33,.2)' }}
+      >
+        <div style={{ background: project.color, padding: '14px 20px 18px' }}>
+          <div style={{ width: 38, height: 4, background: grab, margin: '0 auto 16px' }} />
+          <div style={{ fontSize: 11, letterSpacing: '.12em', textTransform: 'uppercase', fontWeight: 700, color: muted }}>
+            <span style={{ color: tc }}>{project.code}</span> &nbsp;|&nbsp; {range}
+          </div>
+          <div style={{ fontSize: 24, fontWeight: 700, color: tc, marginTop: 5, lineHeight: 1.12 }}>{project.name}</div>
+          <div style={{ fontSize: 14, fontWeight: 500, color: muted, marginTop: 6 }}>Was hast du gemacht?</div>
+        </div>
+        <div style={{ padding: '18px 20px 24px' }}>
+          <div style={{ fontSize: 11, letterSpacing: '.12em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700, marginBottom: 14 }}>
+            Zeit anpassen
+          </div>
+          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'center', gap: 16 }}>
+            <TimePicker edge="start" total={seg.start} color={project.color} onChange={(t) => onSetTime('start', t)} />
+            <TimePicker edge="end" total={seg.end} color={project.color} onChange={(t) => onSetTime('end', t)} />
+          </div>
+          <div style={{ textAlign: 'center', fontSize: 12, color: C.greyFooter, margin: '12px 0 20px' }}>
+            Dauer <span style={{ fontWeight: 700, color: C.dk1 }}>{fmtDur(seg.end - seg.start) + ' h'}</span> &nbsp;·&nbsp; Räder zum Einstellen wischen
+          </div>
+
+          <div style={{ fontSize: 11, letterSpacing: '.12em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700, marginBottom: 10 }}>
+            Tätigkeit
+          </div>
+          <textarea
+            value={draftActivity}
+            onChange={(e) => onActivityInput(e.target.value)}
+            placeholder="Tätigkeiten dieser Buchung erfassen …"
+            style={{ width: '100%', height: 88, resize: 'none', border: '1px solid #D5DBDF', padding: '12px 13px', fontSize: 15, lineHeight: 1.45, color: C.dk1, outline: 'none', background: C.lt2 }}
+          />
+          <div style={{ display: 'flex', gap: 10, marginTop: 16 }}>
+            <button type="button" onClick={onClose} style={{ flex: 1, padding: 13, background: C.lt2, color: C.dk1, fontSize: 14, fontWeight: 700 }}>
+              Schließen
+            </button>
+            <button type="button" onClick={onSave} style={{ flex: 2, padding: 13, background: project.color, color: tc, fontSize: 14, fontWeight: 700 }}>
+              Speichern
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ======================= GAP-FILL PICKER ======================= */
+function GapFillSheet(props: { gap: Gap; projects: Project[]; onPick: (pid: string) => void; onCancel: () => void }) {
+  const { gap, projects, onPick, onCancel } = props;
+  const range = fmtClock(gap.start) + '–' + fmtClock(gap.end) + ' (' + fmtDur(gap.end - gap.start) + ' h)';
+  return (
+    <div
+      onClick={onCancel}
+      style={{ position: 'absolute', inset: 0, background: 'rgba(14,23,33,.4)', zIndex: 30, display: 'flex', alignItems: 'flex-end', animation: 'tkFade .18s ease' }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: '100%', background: C.lt1, padding: '22px 20px 24px', animation: 'tkRise .26s cubic-bezier(.16,.84,.44,1)', boxShadow: '0 -8px 30px rgba(14,23,33,.2)' }}
+      >
+        <div style={{ width: 38, height: 4, background: '#D5DBDF', margin: '0 auto 18px' }} />
+        <div style={{ fontSize: 11, letterSpacing: '.12em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700 }}>Lücke &nbsp;·&nbsp; {range}</div>
+        <div style={{ fontSize: 21, fontWeight: 700, color: C.dk1, margin: '6px 0 16px' }}>Welchem Projekt zuordnen?</div>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+          {projects.map((p) => {
+            const tc = textOn(p.color);
+            return (
+              <button
+                key={p.id}
+                type="button"
+                onClick={() => onPick(p.id)}
+                style={{ display: 'flex', flexDirection: 'column', gap: 2, alignItems: 'flex-start', textAlign: 'left', padding: '12px 13px', background: p.color, color: tc }}
+              >
+                <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '.1em', textTransform: 'uppercase', opacity: 0.75, color: tc }}>{p.code}</span>
+                <span style={{ fontSize: 14, fontWeight: 700, color: tc }}>{p.name}</span>
+              </button>
+            );
+          })}
+        </div>
+        <button type="button" onClick={onCancel} style={{ width: '100%', marginTop: 14, padding: 12, background: C.lt2, color: C.dk1, fontSize: 14, fontWeight: 700 }}>
+          Abbrechen
+        </button>
+      </div>
+    </div>
+  );
+}

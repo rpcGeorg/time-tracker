@@ -1,13 +1,21 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
-import type { Gap, Project, ReportPeriod, Segment, Tab, TileLayout } from './types';
+import type { DaySegment, Gap, Project, ReportPeriod, Segment, Tab, TileLayout } from './types';
 import { C, PALETTE } from './theme';
 import { fmtClock, fmtDur, nowMinutes, textOn } from './lib/time';
 import { buildReport, PPM } from './lib/report';
-import { aggregate } from './lib/aggregate';
+import { aggregate, periodRange } from './lib/aggregate';
 import { TimePicker } from './components/TimePicker';
 import { isSupabaseConfigured, supabase } from './lib/supabase';
 import { Login } from './components/Login';
-import { loadProjects, loadSegments, localISODate, seedDefaultProjects, syncProjects, syncSegments } from './lib/repo';
+import {
+  loadProjects,
+  loadSegments,
+  loadSegmentsRange,
+  localISODate,
+  seedDefaultProjects,
+  syncProjects,
+  syncSegments,
+} from './lib/repo';
 
 interface AppState {
   projects: Project[];
@@ -106,6 +114,10 @@ export default function App() {
   const [dataLoaded, setDataLoaded] = useState(!isSupabaseConfigured);
   const lastSyncRef = useRef('');
 
+  // Bookings for the active Reporting range (Woche/Monat/Jahr/Zeitraum). Today's
+  // live bookings are merged in at render time, so only past days are fetched here.
+  const [reportSegments, setReportSegments] = useState<DaySegment[]>([]);
+
   const setState = (updater: Updater) =>
     setStateRaw((prev) => ({ ...prev, ...(typeof updater === 'function' ? updater(prev) : updater) }));
 
@@ -184,6 +196,30 @@ export default function App() {
     }, 1200);
     return () => clearTimeout(t);
   }, [state.projects, state.segments, userEmail, dataLoaded]);
+
+  // load the bookings for the selected aggregated report range from Supabase
+  useEffect(() => {
+    if (state.tab !== 'report' || state.reportPeriod === 'heute') return;
+    if (!isSupabaseConfigured) {
+      setReportSegments([]); // local mode: only today (merged in at render)
+      return;
+    }
+    if (!userEmail || !dataLoaded) return;
+    const { from, to } = periodRange(state.reportPeriod, state.custFrom, state.custTo, new Date());
+    let active = true;
+    (async () => {
+      try {
+        const segs = await loadSegmentsRange(from, to);
+        if (active) setReportSegments(segs);
+      } catch (e) {
+        console.error('Supabase range load failed', e);
+        if (active) setReportSegments([]);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [state.tab, state.reportPeriod, state.custFrom, state.custTo, userEmail, dataLoaded]);
 
   async function logout() {
     if (supabase) await supabase.auth.signOut();
@@ -523,6 +559,7 @@ export default function App() {
               vNow={vNow}
               today={today}
               clockText={clockText}
+              reportSegments={reportSegments}
               onSetPeriod={(p) => setState({ reportPeriod: p })}
               onSetCust={(field, v) => setState({ [field]: v } as Partial<AppState>)}
               onOpenSheet={openSheet}
@@ -855,6 +892,7 @@ function ReportView(props: {
   vNow: number;
   today: Date;
   clockText: string;
+  reportSegments: DaySegment[];
   onSetPeriod: (p: ReportPeriod) => void;
   onSetCust: (field: 'custFrom' | 'custTo', v: string) => void;
   onOpenSheet: (segId: string) => void;
@@ -862,10 +900,18 @@ function ReportView(props: {
   onStartDrag: (segId: string, edge: 'start' | 'end', e: React.PointerEvent) => void;
   dragMoved: React.MutableRefObject<boolean>;
 }) {
-  const { state: s, vNow, today, clockText, onSetPeriod, onSetCust, onOpenSheet, onOpenGapFill, onStartDrag, dragMoved } = props;
+  const { state: s, vNow, today, clockText, reportSegments, onSetPeriod, onSetCust, onOpenSheet, onOpenGapFill, onStartDrag, dragMoved } = props;
   const period = s.reportPeriod;
   const showTimeline = period === 'heute';
   const showCust = period === 'zeitraum';
+
+  // Merge today's live bookings (state.segments) over the fetched range so
+  // unsaved edits show up immediately; out-of-range days are dropped by aggregate.
+  const todayKey = localISODate();
+  const daySegments: DaySegment[] = [
+    ...reportSegments.filter((seg) => seg.day !== todayKey),
+    ...s.segments.map((seg) => ({ ...seg, day: todayKey })),
+  ];
 
   const periodDefs: [ReportPeriod, string][] = [
     ['heute', 'Heute'],
@@ -879,7 +925,7 @@ function ReportView(props: {
     ? buildReport({ projects: s.projects, segments: s.segments, activeId: s.activeId, vNow, date: today })
     : null;
   const agg = !showTimeline
-    ? aggregate({ projects: s.projects, period, custFrom: s.custFrom, custTo: s.custTo, today })
+    ? aggregate({ projects: s.projects, period, custFrom: s.custFrom, custTo: s.custTo, today, daySegments })
     : null;
 
   const hatch = 'repeating-linear-gradient(135deg,#F3F4F4,#F3F4F4 7px,#E8ECEE 7px,#E8ECEE 14px)';
@@ -1180,6 +1226,11 @@ function ReportView(props: {
           <div style={{ fontSize: 11, letterSpacing: '.12em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700, marginBottom: 14 }}>
             Nach Projekt
           </div>
+          {agg.rankedBars.length === 0 && (
+            <div style={{ fontSize: 13, color: C.muted, padding: '6px 0 4px' }}>
+              Keine Buchungen in diesem Zeitraum.
+            </div>
+          )}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
             {agg.rankedBars.map((rb) => (
               <div key={rb.pid}>

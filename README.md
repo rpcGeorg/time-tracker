@@ -68,9 +68,10 @@ Aus dem Anforderungsdokument übernommen bzw. bei der Umsetzung getroffen:
   Ohne gültige Supabase-Konfiguration fällt die App automatisch auf den lokalen
   Modus (`localStorage`) ohne Login zurück. Das Datenmodell ist weiterhin auf
   einen Tag ausgelegt (Buchungen mit Datum `day`; übergreifende Historie offen).
-- **Aggregierte Auswertungen** (Woche/Monat/Jahr/Zeitraum) basieren auf
-  deterministischen Demo-Daten und sind noch nicht mit den realen Buchungen
-  verknüpft. Nur die Tagesansicht nutzt echte Buchungsdaten.
+- **Aggregierte Auswertungen** (Woche/Monat/Jahr/Zeitraum) basieren auf den
+  **echten Buchungen**: Die jeweils benötigten Tage werden aus Supabase geladen
+  (im lokalen Modus nur der heutige Tag) und nach Tag/Woche/Monat gebündelt;
+  die laufenden Buchungen des heutigen Tages fließen live mit ein.
 - Rollen, Freigabe-/Genehmigungs-Workflows, Mandanten- und Exportfunktionen
   sind nicht enthalten.
 - Zeitliche Granularität: 5-Minuten-Schritte.

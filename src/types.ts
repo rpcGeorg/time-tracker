@@ -15,6 +15,12 @@ export interface Segment {
   activity: string;
 }
 
+/** A booking together with the day it belongs to (YYYY-MM-DD), used for
+ *  multi-day aggregation in the Reporting views. */
+export interface DaySegment extends Segment {
+  day: string;
+}
+
 export type Tab = 'track' | 'report' | 'admin';
 export type TileLayout = 'grid' | 'sized' | 'list';
 export type ReportPeriod = 'heute' | 'woche' | 'monat' | 'jahr' | 'zeitraum';

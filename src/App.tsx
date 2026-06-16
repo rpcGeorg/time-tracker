@@ -1,13 +1,21 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
-import type { Gap, Project, ReportPeriod, Segment, Tab, TileLayout } from './types';
+import type { DaySegment, Gap, Project, ReportPeriod, Segment, Tab, TileLayout } from './types';
 import { C, PALETTE } from './theme';
 import { fmtClock, fmtDur, nowMinutes, textOn } from './lib/time';
 import { buildReport, PPM } from './lib/report';
-import { aggregate } from './lib/aggregate';
+import { aggregate, periodRange } from './lib/aggregate';
 import { TimePicker } from './components/TimePicker';
 import { isSupabaseConfigured, supabase } from './lib/supabase';
 import { Login } from './components/Login';
-import { loadProjects, loadSegments, localISODate, seedDefaultProjects, syncProjects, syncSegments } from './lib/repo';
+import {
+  loadProjects,
+  loadSegments,
+  loadSegmentsRange,
+  localISODate,
+  seedDefaultProjects,
+  syncProjects,
+  syncSegments,
+} from './lib/repo';
 
 interface AppState {
   projects: Project[];
@@ -45,6 +53,7 @@ const SEED_SEGMENTS: Segment[] = [
 ];
 
 const STORAGE_KEY = 'rpc-zeiterfassung-v1';
+const DAYSTART_KEY = 'rpc-zeiterfassung-daystart';
 
 function isoDate(d: Date): string {
   return d.toISOString().slice(0, 10);
@@ -67,6 +76,28 @@ function loadPersisted(): Pick<AppState, 'projects' | 'segments' | 'tileLayout'>
     return { projects: data.projects, segments: data.segments ?? [], tileLayout: data.tileLayout ?? 'grid' };
   } catch {
     return null;
+  }
+}
+
+/** Day-start marker (minutes since midnight), scoped to the current local day.
+ *  Kept separate from the booking data; it is a lightweight local-only marker. */
+function loadDayStart(): number | null {
+  try {
+    const raw = localStorage.getItem(DAYSTART_KEY);
+    if (!raw) return null;
+    const d = JSON.parse(raw);
+    return d && d.day === localISODate() && typeof d.min === 'number' ? d.min : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveDayStart(min: number | null): void {
+  try {
+    if (min == null) localStorage.removeItem(DAYSTART_KEY);
+    else localStorage.setItem(DAYSTART_KEY, JSON.stringify({ day: localISODate(), min }));
+  } catch {
+    /* ignore quota / privacy-mode errors */
   }
 }
 
@@ -105,6 +136,21 @@ export default function App() {
   const [userEmail, setUserEmail] = useState<string | null>(null);
   const [dataLoaded, setDataLoaded] = useState(!isSupabaseConfigured);
   const lastSyncRef = useRef('');
+
+  // Bookings for the active Reporting range (Woche/Monat/Jahr/Zeitraum). Today's
+  // live bookings are merged in at render time, so only past days are fetched here.
+  const [reportSegments, setReportSegments] = useState<DaySegment[]>([]);
+
+  // "Tagesstart" marker: a day-start time (minutes since midnight) shown in the
+  // day timeline. It does not start a booking.
+  const [dayStart, setDayStart] = useState<number | null>(() => loadDayStart());
+  const [dayStartOpen, setDayStartOpen] = useState(false);
+
+  function applyDayStart(min: number | null) {
+    setDayStart(min);
+    saveDayStart(min);
+    setDayStartOpen(false);
+  }
 
   const setState = (updater: Updater) =>
     setStateRaw((prev) => ({ ...prev, ...(typeof updater === 'function' ? updater(prev) : updater) }));
@@ -184,6 +230,30 @@ export default function App() {
     }, 1200);
     return () => clearTimeout(t);
   }, [state.projects, state.segments, userEmail, dataLoaded]);
+
+  // load the bookings for the selected aggregated report range from Supabase
+  useEffect(() => {
+    if (state.tab !== 'report' || state.reportPeriod === 'heute') return;
+    if (!isSupabaseConfigured) {
+      setReportSegments([]); // local mode: only today (merged in at render)
+      return;
+    }
+    if (!userEmail || !dataLoaded) return;
+    const { from, to } = periodRange(state.reportPeriod, state.custFrom, state.custTo, new Date());
+    let active = true;
+    (async () => {
+      try {
+        const segs = await loadSegmentsRange(from, to);
+        if (active) setReportSegments(segs);
+      } catch (e) {
+        console.error('Supabase range load failed', e);
+        if (active) setReportSegments([]);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [state.tab, state.reportPeriod, state.custFrom, state.custTo, userEmail, dataLoaded]);
 
   async function logout() {
     if (supabase) await supabase.auth.signOut();
@@ -469,34 +539,10 @@ export default function App() {
               Zeiterfassung
             </span>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-            {isTrack && (
-              <button
-                type="button"
-                onClick={endDay}
-                disabled={!(running || s.paused)}
-                style={{
-                  flex: '0 0 auto',
-                  padding: '8px 13px',
-                  fontSize: 11,
-                  fontWeight: 700,
-                  letterSpacing: '.08em',
-                  textTransform: 'uppercase',
-                  whiteSpace: 'nowrap',
-                  border: '1px solid ' + (running || s.paused ? C.accent1 : '#D5DBDF'),
-                  color: running || s.paused ? C.accent1 : '#B9C4CB',
-                  background: running || s.paused ? C.lt1 : '#F7F8F9',
-                  cursor: running || s.paused ? 'pointer' : 'default',
-                }}
-              >
-                Tagesende
-              </button>
-            )}
-            <div style={{ textAlign: 'right', lineHeight: 1.2, whiteSpace: 'nowrap' }}>
-              <div style={{ fontSize: 13, fontWeight: 700, color: C.dk1, whiteSpace: 'nowrap' }}>{dateText}</div>
-              <div style={{ fontSize: 11, color: C.greyFooter, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
-                {clockText} Uhr
-              </div>
+          <div style={{ textAlign: 'right', lineHeight: 1.2, whiteSpace: 'nowrap' }}>
+            <div style={{ fontSize: 13, fontWeight: 700, color: C.dk1, whiteSpace: 'nowrap' }}>{dateText}</div>
+            <div style={{ fontSize: 11, color: C.greyFooter, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+              {clockText} Uhr
             </div>
           </div>
         </header>
@@ -511,9 +557,12 @@ export default function App() {
               bannerProj={bannerProj ?? null}
               totals={totals}
               topId={topId}
+              dayStart={dayStart}
               onTapProject={tapProject}
               onTogglePause={togglePause}
               onSetLayout={(l) => setState({ tileLayout: l })}
+              onOpenDayStart={() => setDayStartOpen(true)}
+              onEndDay={endDay}
             />
           )}
 
@@ -523,6 +572,8 @@ export default function App() {
               vNow={vNow}
               today={today}
               clockText={clockText}
+              reportSegments={reportSegments}
+              dayStart={dayStart}
               onSetPeriod={(p) => setState({ reportPeriod: p })}
               onSetCust={(field, v) => setState({ [field]: v } as Partial<AppState>)}
               onOpenSheet={openSheet}
@@ -574,6 +625,17 @@ export default function App() {
             onCancel={() => setState({ fillGap: null })}
           />
         )}
+
+        {/* Tagesstart marker picker */}
+        {dayStartOpen && (
+          <DayStartSheet
+            initial={dayStart ?? vNow}
+            isSet={dayStart != null}
+            onSave={applyDayStart}
+            onClear={() => applyDayStart(null)}
+            onCancel={() => setDayStartOpen(false)}
+          />
+        )}
       </div>
     </div>
   );
@@ -587,11 +649,14 @@ function TrackView(props: {
   bannerProj: Project | null;
   totals: Record<string, number>;
   topId: string | undefined;
+  dayStart: number | null;
   onTapProject: (pid: string) => void;
   onTogglePause: () => void;
   onSetLayout: (l: TileLayout) => void;
+  onOpenDayStart: () => void;
+  onEndDay: () => void;
 }) {
-  const { state: s, running, activeSeg, bannerProj, totals, topId, onTapProject, onTogglePause, onSetLayout } = props;
+  const { state: s, running, activeSeg, bannerProj, totals, topId, dayStart, onTapProject, onTogglePause, onSetLayout, onOpenDayStart, onEndDay } = props;
 
   // ---- banner ----
   let bannerBg: string;
@@ -675,8 +740,51 @@ function TrackView(props: {
       ? { display: 'flex', flexDirection: 'column', gap: 0, padding: '0 20px' }
       : { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 0, padding: '0 20px' };
 
+  const dayCtlBtn: CSSProperties = {
+    flex: '1 1 0',
+    padding: '10px 8px',
+    fontSize: 12,
+    fontWeight: 700,
+    letterSpacing: '.06em',
+    textTransform: 'uppercase',
+    whiteSpace: 'nowrap',
+    cursor: 'pointer',
+  };
+  const canEnd = running || s.paused;
+
   return (
     <section>
+      {/* Tagesstart / Tagesende controls */}
+      <div style={{ display: 'flex', gap: 10, margin: '16px 20px 0' }}>
+        <button
+          type="button"
+          onClick={onOpenDayStart}
+          title="Tagesbeginn markieren"
+          style={{
+            ...dayCtlBtn,
+            border: '1px solid ' + (dayStart != null ? C.accent2 : '#D5DBDF'),
+            color: dayStart != null ? C.accent2 : C.accent1,
+            background: C.lt1,
+          }}
+        >
+          {dayStart != null ? 'Start ' + fmtClock(dayStart) : 'Tagesstart'}
+        </button>
+        <button
+          type="button"
+          onClick={onEndDay}
+          disabled={!canEnd}
+          style={{
+            ...dayCtlBtn,
+            border: '1px solid ' + (canEnd ? C.accent1 : '#D5DBDF'),
+            color: canEnd ? C.accent1 : '#B9C4CB',
+            background: canEnd ? C.lt1 : '#F7F8F9',
+            cursor: canEnd ? 'pointer' : 'default',
+          }}
+        >
+          Tagesende
+        </button>
+      </div>
+
       {/* status banner */}
       <div style={{ margin: '16px 20px 0', padding: '16px 18px', background: bannerBg, border: bannerBorder }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 14 }}>
@@ -855,6 +963,8 @@ function ReportView(props: {
   vNow: number;
   today: Date;
   clockText: string;
+  reportSegments: DaySegment[];
+  dayStart: number | null;
   onSetPeriod: (p: ReportPeriod) => void;
   onSetCust: (field: 'custFrom' | 'custTo', v: string) => void;
   onOpenSheet: (segId: string) => void;
@@ -862,10 +972,18 @@ function ReportView(props: {
   onStartDrag: (segId: string, edge: 'start' | 'end', e: React.PointerEvent) => void;
   dragMoved: React.MutableRefObject<boolean>;
 }) {
-  const { state: s, vNow, today, clockText, onSetPeriod, onSetCust, onOpenSheet, onOpenGapFill, onStartDrag, dragMoved } = props;
+  const { state: s, vNow, today, clockText, reportSegments, dayStart, onSetPeriod, onSetCust, onOpenSheet, onOpenGapFill, onStartDrag, dragMoved } = props;
   const period = s.reportPeriod;
   const showTimeline = period === 'heute';
   const showCust = period === 'zeitraum';
+
+  // Merge today's live bookings (state.segments) over the fetched range so
+  // unsaved edits show up immediately; out-of-range days are dropped by aggregate.
+  const todayKey = localISODate();
+  const daySegments: DaySegment[] = [
+    ...reportSegments.filter((seg) => seg.day !== todayKey),
+    ...s.segments.map((seg) => ({ ...seg, day: todayKey })),
+  ];
 
   const periodDefs: [ReportPeriod, string][] = [
     ['heute', 'Heute'],
@@ -879,7 +997,7 @@ function ReportView(props: {
     ? buildReport({ projects: s.projects, segments: s.segments, activeId: s.activeId, vNow, date: today })
     : null;
   const agg = !showTimeline
-    ? aggregate({ projects: s.projects, period, custFrom: s.custFrom, custTo: s.custTo, today })
+    ? aggregate({ projects: s.projects, period, custFrom: s.custFrom, custTo: s.custTo, today, daySegments })
     : null;
 
   const hatch = 'repeating-linear-gradient(135deg,#F3F4F4,#F3F4F4 7px,#E8ECEE 7px,#E8ECEE 14px)';
@@ -1090,6 +1208,26 @@ function ReportView(props: {
                 );
               })}
             </div>
+            {dayStart != null && (
+              <>
+                <div style={{ position: 'absolute', left: 48, right: 0, top: dayStart * PPM, borderTop: '2px solid ' + C.accent2, pointerEvents: 'none' }} />
+                <div
+                  style={{
+                    position: 'absolute',
+                    left: 52,
+                    top: dayStart * PPM - 13,
+                    fontSize: 10,
+                    fontWeight: 700,
+                    letterSpacing: '.06em',
+                    textTransform: 'uppercase',
+                    color: C.accent2,
+                    pointerEvents: 'none',
+                  }}
+                >
+                  Start {fmtClock(dayStart)}
+                </div>
+              </>
+            )}
             <div style={{ position: 'absolute', left: 48, right: 0, top: rep.nowTop, borderTop: '2px dashed #0E1721', pointerEvents: 'none' }} />
             <div
               style={{
@@ -1180,6 +1318,11 @@ function ReportView(props: {
           <div style={{ fontSize: 11, letterSpacing: '.12em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700, marginBottom: 14 }}>
             Nach Projekt
           </div>
+          {agg.rankedBars.length === 0 && (
+            <div style={{ fontSize: 13, color: C.muted, padding: '6px 0 4px' }}>
+              Keine Buchungen in diesem Zeitraum.
+            </div>
+          )}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
             {agg.rankedBars.map((rb) => (
               <div key={rb.pid}>
@@ -1530,6 +1673,61 @@ function GapFillSheet(props: { gap: Gap; projects: Project[]; onPick: (pid: stri
         <button type="button" onClick={onCancel} style={{ width: '100%', marginTop: 14, padding: 12, background: C.lt2, color: C.dk1, fontSize: 14, fontWeight: 700 }}>
           Abbrechen
         </button>
+      </div>
+    </div>
+  );
+}
+
+/* ======================= TAGESSTART (MARKER) ======================= */
+function DayStartSheet(props: {
+  initial: number;
+  isSet: boolean;
+  onSave: (min: number) => void;
+  onClear: () => void;
+  onCancel: () => void;
+}) {
+  const { initial, isSet, onSave, onClear, onCancel } = props;
+  const [val, setVal] = useState(initial);
+  return (
+    <div
+      onClick={onCancel}
+      style={{ position: 'absolute', inset: 0, background: 'rgba(14,23,33,.4)', zIndex: 30, display: 'flex', alignItems: 'flex-end', animation: 'tkFade .18s ease' }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: '100%', background: C.lt1, padding: '22px 20px 24px', animation: 'tkRise .26s cubic-bezier(.16,.84,.44,1)', boxShadow: '0 -8px 30px rgba(14,23,33,.2)' }}
+      >
+        <div style={{ width: 38, height: 4, background: '#D5DBDF', margin: '0 auto 18px' }} />
+        <div style={{ fontSize: 11, letterSpacing: '.12em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700 }}>Tagesstart</div>
+        <div style={{ fontSize: 21, fontWeight: 700, color: C.dk1, margin: '6px 0 4px' }}>Tagesbeginn markieren</div>
+        <div style={{ fontSize: 13, color: C.greyFooter, marginBottom: 18 }}>
+          Setzt nur eine Markierung in der Tagesansicht – es wird keine Buchung gestartet.
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'center' }}>
+          <div style={{ width: '60%' }}>
+            <TimePicker edge="start" total={val} color={C.accent2} onChange={setVal} />
+          </div>
+        </div>
+        <div style={{ textAlign: 'center', fontSize: 12, color: C.greyFooter, margin: '12px 0 18px' }}>
+          Marke bei <span style={{ fontWeight: 700, color: C.dk1 }}>{fmtClock(val)}</span> &nbsp;·&nbsp; Räder zum Einstellen wischen
+        </div>
+        <div style={{ display: 'flex', gap: 10 }}>
+          <button type="button" onClick={onCancel} style={{ flex: 1, padding: 13, background: C.lt2, color: C.dk1, fontSize: 14, fontWeight: 700 }}>
+            Abbrechen
+          </button>
+          <button type="button" onClick={() => onSave(val)} style={{ flex: 2, padding: 13, background: C.accent2, color: C.lt1, fontSize: 14, fontWeight: 700 }}>
+            {isSet ? 'Aktualisieren' : 'Setzen'}
+          </button>
+        </div>
+        {isSet && (
+          <button
+            type="button"
+            onClick={onClear}
+            style={{ width: '100%', marginTop: 10, padding: 11, background: 'transparent', color: C.critical, fontSize: 13, fontWeight: 700, letterSpacing: '.04em' }}
+          >
+            Markierung entfernen
+          </button>
+        )}
       </div>
     </div>
   );

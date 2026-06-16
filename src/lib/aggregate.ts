@@ -1,4 +1,4 @@
-import type { Project, ReportPeriod } from '../types';
+import type { DaySegment, Project, ReportPeriod } from '../types';
 import { fmtH } from './time';
 
 export interface AggSegment {
@@ -35,19 +35,27 @@ export interface AggData {
 
 const MONTHS = ['Jan', 'Feb', 'Mär', 'Apr', 'Mai', 'Jun', 'Jul', 'Aug', 'Sep', 'Okt', 'Nov', 'Dez'];
 
-// deterministic hashing so demo data is stable per (period, bucket, project)
-function hash(str: string): number {
-  let h = 2166136261;
-  for (let i = 0; i < str.length; i++) {
-    h ^= str.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return h >>> 0;
+/** Local YYYY-MM-DD → Date at local midnight (avoids UTC off-by-one). */
+function parseDay(s: string): Date {
+  const [y, m, d] = s.split('-').map(Number);
+  return new Date(y, (m || 1) - 1, d || 1);
 }
-function rand(seed: number): number {
-  let x = Math.imul(seed ^ (seed >>> 15), 1 | seed);
-  x ^= x + Math.imul(x ^ (x >>> 7), 61 | x);
-  return ((x ^ (x >>> 14)) >>> 0) / 4294967296;
+function dayKey(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+function addDays(d: Date, n: number): Date {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
+}
+/** Whole days from a to b (both at local midnight). */
+function dayDiff(a: Date, b: Date): number {
+  return Math.round((b.getTime() - a.getTime()) / 86400000);
+}
+/** Monday on or before d. */
+function mondayOf(d: Date): Date {
+  return addDays(d, -((d.getDay() + 6) % 7));
 }
 
 function isoWeek(d: Date): number {
@@ -60,88 +68,141 @@ function isoWeek(d: Date): number {
   return 1 + Math.round((date.getTime() - firstThursday.getTime()) / (7 * 86400000));
 }
 
+/** Inclusive day range (YYYY-MM-DD) that a period covers — used both to fetch
+ *  the bookings and to bound the aggregation. */
+export function periodRange(
+  period: ReportPeriod,
+  custFrom: string,
+  custTo: string,
+  today: Date,
+): { from: string; to: string } {
+  if (period === 'woche') {
+    const mon = mondayOf(today);
+    return { from: dayKey(mon), to: dayKey(addDays(mon, 6)) };
+  }
+  if (period === 'monat') {
+    const first = new Date(today.getFullYear(), today.getMonth(), 1);
+    const last = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+    return { from: dayKey(first), to: dayKey(last) };
+  }
+  if (period === 'jahr') {
+    return { from: `${today.getFullYear()}-01-01`, to: `${today.getFullYear()}-12-31` };
+  }
+  // zeitraum (and any fallback): normalise order
+  const from = custFrom <= custTo ? custFrom : custTo;
+  const to = custFrom <= custTo ? custTo : custFrom;
+  return { from, to };
+}
+
 interface AggInput {
   projects: Project[];
   period: ReportPeriod;
   custFrom: string;
   custTo: string;
   today: Date;
+  /** Real bookings across the period (already tagged with their day). */
+  daySegments: DaySegment[];
 }
 
-/** Demo aggregation for Woche / Monat / Jahr / Zeitraum (FA-23 … FA-25).
- *  Per the requirements doc these views are based on deterministic demo data
- *  and are not yet linked to the real bookings. */
-export function aggregate({ projects, period, custFrom, custTo, today }: AggInput): AggData {
+interface BucketPlan {
+  labels: string[];
+  rangeLabel: string;
+  from: Date;
+  to: Date;
+  /** Bucket index for a given day, or -1 when out of range. */
+  bucketOf: (d: Date) => number;
+}
+
+/** Build the bucket layout (labels + day→bucket mapping) for a period. */
+function planBuckets(period: ReportPeriod, custFrom: string, custTo: string, today: Date): BucketPlan {
   const fmtD = (d: Date) => d.getDate() + '. ' + MONTHS[d.getMonth()];
 
-  let labels: string[] = [];
-  let weekend: number[] = [];
-  let rangeLabel = '';
-
   if (period === 'woche') {
-    labels = ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So'];
-    weekend = [0, 0, 0, 0, 0, 1, 1];
-    const mondayOffset = (today.getDay() + 6) % 7;
-    const mon = new Date(today.getTime() - mondayOffset * 86400000);
-    const sun = new Date(mon.getTime() + 6 * 86400000);
-    rangeLabel = mon.getDate() + '.–' + sun.getDate() + '. ' + MONTHS[sun.getMonth()] + ' ' + sun.getFullYear();
-  } else if (period === 'monat') {
-    const y = today.getFullYear();
-    const m = today.getMonth();
-    const first = new Date(y, m, 1);
-    const last = new Date(y, m + 1, 0);
-    const w0 = isoWeek(first);
-    const w1 = isoWeek(last);
-    const nWeeks = w1 >= w0 ? w1 - w0 + 1 : w1 + 1; // year wrap (Dec→Jan)
-    for (let i = 0; i < nWeeks; i++) labels.push('KW ' + (w0 + i));
-    rangeLabel = first.toLocaleDateString('de-DE', { month: 'long', year: 'numeric' });
-  } else if (period === 'jahr') {
-    labels = [...MONTHS];
-    rangeLabel = String(today.getFullYear());
-  } else {
-    const from = new Date(custFrom);
-    const to = new Date(custTo);
-    const days = Math.max(1, Math.round((to.getTime() - from.getTime()) / 86400000) + 1);
-    if (days <= 21) {
-      for (let i = 0; i < days; i++) {
-        const d = new Date(from.getTime() + i * 86400000);
-        labels.push(String(d.getDate()));
-        weekend.push(d.getDay() === 0 || d.getDay() === 6 ? 1 : 0);
-      }
-    } else {
-      const wks = Math.ceil(days / 7);
-      for (let i = 0; i < wks; i++) labels.push('W' + (i + 1));
-    }
-    rangeLabel = fmtD(from) + ' – ' + fmtD(to) + ' ' + to.getFullYear();
+    const mon = mondayOf(today);
+    const sun = addDays(mon, 6);
+    return {
+      labels: ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So'],
+      rangeLabel: mon.getDate() + '.–' + sun.getDate() + '. ' + MONTHS[sun.getMonth()] + ' ' + sun.getFullYear(),
+      from: mon,
+      to: sun,
+      bucketOf: (d) => dayDiff(mon, d),
+    };
   }
 
-  const W = projects.map(
-    (_p, i) => [1, 0.85, 0.7, 0.55, 0.45, 0.4, 0.5, 0.45, 0.4, 0.35, 0.3, 0.3, 0.3, 0.3, 0.3][i] ?? 0.3,
-  );
-  const sumW = W.reduce((a, b) => a + b, 0) || 1;
-  const isDaily = period === 'woche' || (period === 'zeitraum' && weekend.length > 0);
-  const target = period === 'woche' ? 8 : period === 'jahr' ? 150 : period === 'monat' ? 38 : isDaily ? 8 : 38;
+  if (period === 'monat') {
+    const first = new Date(today.getFullYear(), today.getMonth(), 1);
+    const last = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+    const firstMon = mondayOf(first);
+    const labels: string[] = [];
+    for (let w = firstMon; w <= last; w = addDays(w, 7)) labels.push('KW ' + isoWeek(w));
+    return {
+      labels,
+      rangeLabel: first.toLocaleDateString('de-DE', { month: 'long', year: 'numeric' }),
+      from: first,
+      to: last,
+      bucketOf: (d) => Math.floor(dayDiff(firstMon, d) / 7),
+    };
+  }
 
+  if (period === 'jahr') {
+    const y = today.getFullYear();
+    return {
+      labels: [...MONTHS],
+      rangeLabel: String(y),
+      from: new Date(y, 0, 1),
+      to: new Date(y, 11, 31),
+      bucketOf: (d) => d.getMonth(),
+    };
+  }
+
+  // zeitraum
+  const range = periodRange('zeitraum', custFrom, custTo, today);
+  const from = parseDay(range.from);
+  const to = parseDay(range.to);
+  const days = Math.max(1, dayDiff(from, to) + 1);
+  const rangeLabel = fmtD(from) + ' – ' + fmtD(to) + ' ' + to.getFullYear();
+  if (days <= 21) {
+    const labels: string[] = [];
+    for (let i = 0; i < days; i++) labels.push(String(addDays(from, i).getDate()));
+    return { labels, rangeLabel, from, to, bucketOf: (d) => dayDiff(from, d) };
+  }
+  const wks = Math.ceil(days / 7);
+  const labels: string[] = [];
+  for (let i = 0; i < wks; i++) labels.push('W' + (i + 1));
+  return { labels, rangeLabel, from, to, bucketOf: (d) => Math.floor(dayDiff(from, d) / 7) };
+}
+
+/** Aggregate the real bookings for Woche / Monat / Jahr / Zeitraum (FA-23 … FA-25).
+ *  Hours come from the actual segment durations; out-of-range days are ignored. */
+export function aggregate({ projects, period, custFrom, custTo, today, daySegments }: AggInput): AggData {
+  const plan = planBuckets(period, custFrom, custTo, today);
+  const { labels, rangeLabel, from, to, bucketOf } = plan;
+
+  const known = new Set(projects.map((p) => p.id));
   const totals: Record<string, number> = {};
   projects.forEach((p) => (totals[p.id] = 0));
+  const bucketTotals: Record<string, number>[] = labels.map(() => ({}));
+
+  daySegments.forEach((seg) => {
+    if (!known.has(seg.pid)) return;
+    const d = parseDay(seg.day);
+    if (d < from || d > to) return;
+    const b = bucketOf(d);
+    if (b < 0 || b >= labels.length) return;
+    const h = Math.max(0, seg.end - seg.start) / 60;
+    if (h <= 0) return;
+    totals[seg.pid] += h;
+    bucketTotals[b][seg.pid] = (bucketTotals[b][seg.pid] || 0) + h;
+  });
 
   const buckets = labels.map((lab, b) => {
-    const wf = isDaily && weekend[b] ? 0.16 : 1;
     const segs: AggSegment[] = [];
-    projects.forEach((p, i) => {
-      const seed = hash(period + '|' + b + '|' + p.id);
-      const r1 = rand(seed);
-      const r2 = rand(seed ^ 0x9e3779b9);
-      let h = (W[i] / sumW) * target * (0.5 + 1.0 * r1) * wf;
-      if (r2 < 0.16) h = 0;
-      h = Math.round(h * 4) / 4;
-      if (h > 0) {
-        totals[p.id] += h;
-        segs.push({ pid: p.id, color: p.color, h });
-      }
+    projects.forEach((p) => {
+      const h = bucketTotals[b][p.id] || 0;
+      if (h > 0) segs.push({ pid: p.id, color: p.color, h });
     });
-    const bt = segs.reduce((a, x) => a + x.h, 0);
-    return { label: lab, segs, total: bt };
+    const total = segs.reduce((a, x) => a + x.h, 0);
+    return { label: lab, segs, total };
   });
 
   const grand = Object.values(totals).reduce((a, b) => a + b, 0);

@@ -39,7 +39,8 @@ Gerät nach Login geladen. Abmelden geht im Tab **Pflege** unten.
 - Datenmodell ist weiterhin **auf einen Tag** ausgelegt (Uhrzeit ohne übergreifende
   Historie). Buchungen werden mit dem heutigen Datum (`day`) gespeichert; vergangene
   Tage bleiben in der DB erhalten als Grundlage für eine spätere Mehrtages-Ansicht.
-- Die **aggregierten Auswertungen** (Woche/Monat/Jahr/Zeitraum) zeigen weiterhin
-  Demo-Daten, nicht die realen Buchungen.
+- Die **aggregierten Auswertungen** (Woche/Monat/Jahr/Zeitraum) nutzen die
+  echten Buchungen aus Supabase (die je Ansicht benötigten Tage werden geladen;
+  im lokalen Modus steht nur der heutige Tag zur Verfügung).
 - Ohne gültige Supabase-Konfiguration fällt die App automatisch auf den lokalen
   Modus (`localStorage`) zurück und funktioniert ohne Login.

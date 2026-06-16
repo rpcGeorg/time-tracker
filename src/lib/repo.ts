@@ -1,5 +1,5 @@
 import { supabase } from './supabase';
-import type { Project, Segment } from '../types';
+import type { DaySegment, Project, Segment } from '../types';
 
 /** Local (not UTC) date as YYYY-MM-DD, used as the booking "day". */
 export function localISODate(d = new Date()): string {
@@ -21,6 +21,9 @@ interface DbSegment {
   start_min: number;
   end_min: number;
   activity: string | null;
+}
+interface DbDaySegment extends DbSegment {
+  day: string;
 }
 
 export async function loadProjects(): Promise<Project[]> {
@@ -44,6 +47,28 @@ export async function loadSegments(day: string): Promise<Segment[]> {
   return (data as DbSegment[]).map((s) => ({
     id: s.id,
     pid: s.pid,
+    start: s.start_min,
+    end: s.end_min,
+    activity: s.activity ?? '',
+  }));
+}
+
+/** Load all bookings between `fromDay` and `toDay` (inclusive), each tagged
+ *  with its `day`. Used by the aggregated Reporting views. */
+export async function loadSegmentsRange(fromDay: string, toDay: string): Promise<DaySegment[]> {
+  if (!supabase) return [];
+  const { data, error } = await supabase
+    .from('segments')
+    .select('id, pid, day, start_min, end_min, activity')
+    .gte('day', fromDay)
+    .lte('day', toDay)
+    .order('day', { ascending: true })
+    .order('start_min', { ascending: true });
+  if (error) throw error;
+  return (data as DbDaySegment[]).map((s) => ({
+    id: s.id,
+    pid: s.pid,
+    day: s.day,
     start: s.start_min,
     end: s.end_min,
     activity: s.activity ?? '',

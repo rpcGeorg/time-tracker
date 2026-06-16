@@ -297,12 +297,16 @@ export default function App() {
       if (s.activeId) {
         const cur = segments.find((g) => g.id === s.activeId);
         if (cur && cur.pid === pid) return s; // already running this project
-        segments = segments.map((g) => (g.id === s.activeId ? { ...g, end: vNow } : g));
-        // Switching to a different project always prompts for the activity of the
-        // booking that was just stopped, so the description is never lost.
         if (cur) {
-          sheetSegId = cur.id;
-          draftActivity = cur.activity || '';
+          if (vNow - cur.start >= 1) {
+            // keep the finished booking and prompt for its activity description
+            segments = segments.map((g) => (g.id === s.activeId ? { ...g, end: vNow } : g));
+            sheetSegId = cur.id;
+            draftActivity = cur.activity || '';
+          } else {
+            // discard a zero-minute booking from an accidental / too-quick switch
+            segments = segments.filter((g) => g.id !== s.activeId);
+          }
         }
       }
       const id = 'u' + Date.now();

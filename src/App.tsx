@@ -298,7 +298,9 @@ export default function App() {
         const cur = segments.find((g) => g.id === s.activeId);
         if (cur && cur.pid === pid) return s; // already running this project
         segments = segments.map((g) => (g.id === s.activeId ? { ...g, end: vNow } : g));
-        if (cur && cur.end - cur.start >= 1) {
+        // Switching to a different project always prompts for the activity of the
+        // booking that was just stopped, so the description is never lost.
+        if (cur) {
           sheetSegId = cur.id;
           draftActivity = cur.activity || '';
         }

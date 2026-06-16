@@ -658,6 +658,7 @@ export default function App() {
               state={s}
               onAdd={() => setTodoSheet('new')}
               onEdit={(t) => setTodoSheet(t)}
+              onTake={takeTodoToProject}
             />
           )}
 
@@ -1726,8 +1727,9 @@ function DailyTasksView(props: {
   state: AppState;
   onAdd: () => void;
   onEdit: (t: Todo) => void;
+  onTake: (t: Todo) => void;
 }) {
-  const { state: s, onAdd, onEdit } = props;
+  const { state: s, onAdd, onEdit, onTake } = props;
   const [sortKey, setSortKey] = useState<TaskSortKey>('prio');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
 
@@ -1791,10 +1793,11 @@ function DailyTasksView(props: {
         ) : (
           <table style={{ width: '100%', borderCollapse: 'collapse', tableLayout: 'fixed' }}>
             <colgroup>
-              <col style={{ width: '40%' }} />
-              <col style={{ width: '16%' }} />
-              <col style={{ width: '14%' }} />
-              <col style={{ width: '14%' }} />
+              <col style={{ width: '34%' }} />
+              <col style={{ width: '15%' }} />
+              <col style={{ width: '11%' }} />
+              <col style={{ width: '11%' }} />
+              <col style={{ width: '13%' }} />
               <col style={{ width: '16%' }} />
             </colgroup>
             <thead>
@@ -1804,6 +1807,7 @@ function DailyTasksView(props: {
                 {th('Frist', 'urgency', 'right')}
                 {th('Wicht', 'importance', 'right')}
                 {th('Prio', 'prio', 'right')}
+                <th style={{ borderBottom: '2px solid #E1E5E8' }} aria-label="Übernehmen" />
               </tr>
             </thead>
             <tbody>
@@ -1814,6 +1818,33 @@ function DailyTasksView(props: {
                   <td style={taskNumCell} title={URGENCY_LABELS[t.urgency]}>{t.urgency + 1}</td>
                   <td style={taskNumCell} title={IMPORTANCE_LABELS[t.importance]}>{t.importance + 1}</td>
                   <td style={{ ...taskNumCell, color: C.dk1, fontWeight: 700 }}>{t.urgency + t.importance + 2}</td>
+                  <td style={{ ...taskCellStyle, textAlign: 'center', padding: '6px 2px' }}>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onTake(t);
+                      }}
+                      disabled={!t.projectId}
+                      title={t.projectId ? 'In Projektübersicht übernehmen' : 'Erst ein Projekt auswählen'}
+                      style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        width: 30,
+                        height: 30,
+                        padding: 0,
+                        border: '1px solid ' + (t.projectId ? C.accent1 : '#E1E5E8'),
+                        background: t.projectId ? C.lt1 : '#F7F8F9',
+                        color: t.projectId ? C.accent1 : '#C7CFD4',
+                        cursor: t.projectId ? 'pointer' : 'not-allowed',
+                      }}
+                    >
+                      <svg width={15} height={15} viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M8 5v14l11-7z" fill="currentColor" />
+                      </svg>
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>

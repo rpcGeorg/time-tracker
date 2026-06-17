@@ -4,7 +4,6 @@ import { C, PALETTE } from './theme';
 import { fmtClock, fmtDur, nowMinutes, textOn } from './lib/time';
 import { buildReport, PPM } from './lib/report';
 import { aggregate, periodRange } from './lib/aggregate';
-import { TimePicker } from './components/TimePicker';
 import { DrawingPad } from './components/DrawingPad';
 import { isSupabaseConfigured, supabase } from './lib/supabase';
 import { Login } from './components/Login';
@@ -43,7 +42,6 @@ interface AppState {
   draftColor: string;
   tab: Tab;
   sheetSegId: string | null;
-  draftActivity: string;
   tileLayout: TileLayout;
   fillGap: Gap | null;
   reportPeriod: ReportPeriod;
@@ -155,7 +153,6 @@ function initialState(): AppState {
     draftColor: PALETTE[0],
     tab: 'tasks',
     sheetSegId: null,
-    draftActivity: '',
     tileLayout: persisted?.tileLayout ?? 'grid',
     fillGap: null,
     reportPeriod: 'heute',
@@ -348,7 +345,6 @@ export default function App() {
     setState((s) => {
       let segments = s.segments.slice();
       let sheetSegId = s.sheetSegId;
-      let draftActivity = s.draftActivity;
       if (s.activeId) {
         const cur = segments.find((g) => g.id === s.activeId);
         if (cur && cur.pid === pid) return s; // already running this project
@@ -356,10 +352,7 @@ export default function App() {
           if (vNow - cur.start >= 1) {
             // keep the finished booking; only prompt for a description if none was entered yet
             segments = segments.map((g) => (g.id === s.activeId ? { ...g, end: vNow } : g));
-            if (needsActivity(cur)) {
-              sheetSegId = cur.id;
-              draftActivity = cur.activity || '';
-            }
+            if (needsActivity(cur)) sheetSegId = cur.id;
           } else {
             // discard a zero-minute booking from an accidental / too-quick switch
             segments = segments.filter((g) => g.id !== s.activeId);
@@ -368,7 +361,7 @@ export default function App() {
       }
       const id = 'u' + Date.now();
       segments.push({ id, pid, start: vNow, end: vNow, activity: '', plannedEnd: null, checklist: emptyChecklist(), todoId: null });
-      return { segments, activeId: id, paused: false, pausedPid: null, sheetSegId, draftActivity };
+      return { segments, activeId: id, paused: false, pausedPid: null, sheetSegId };
     });
   }
 
@@ -391,17 +384,13 @@ export default function App() {
   function endDay() {
     setState((s) => {
       let sheetSegId = s.sheetSegId;
-      let draftActivity = s.draftActivity;
       let segments = s.segments;
       if (s.activeId) {
         const cur = s.segments.find((g) => g.id === s.activeId);
         segments = s.segments.map((g) => (g.id === s.activeId ? { ...g, end: vNow } : g));
-        if (cur && vNow - cur.start >= 1 && needsActivity(cur)) {
-          sheetSegId = cur.id;
-          draftActivity = cur.activity || '';
-        }
+        if (cur && vNow - cur.start >= 1 && needsActivity(cur)) sheetSegId = cur.id;
       }
-      return { segments, activeId: null, paused: false, pausedPid: null, sheetSegId, draftActivity };
+      return { segments, activeId: null, paused: false, pausedPid: null, sheetSegId };
     });
   }
 
@@ -448,17 +437,14 @@ export default function App() {
   function openSheet(segId: string) {
     const seg = state.segments.find((g) => g.id === segId);
     if (!seg) return;
-    setState({ sheetSegId: segId, draftActivity: seg.activity || '' });
+    setState({ sheetSegId: segId });
   }
-  function saveActivity() {
-    setState((s) => ({
-      segments: s.segments.map((g) => (g.id === s.sheetSegId ? { ...g, activity: s.draftActivity } : g)),
-      sheetSegId: null,
-      draftActivity: '',
-    }));
+  /** Edit the description (activity) of the booking shown in the detail sheet. */
+  function setSheetActivity(text: string) {
+    setState((s) => ({ segments: s.segments.map((g) => (g.id === s.sheetSegId ? { ...g, activity: text } : g)) }));
   }
   function closeSheet() {
-    setState({ sheetSegId: null, draftActivity: '' });
+    setState({ sheetSegId: null });
   }
   function deleteSegment(segId: string) {
     setState((st) => ({
@@ -467,7 +453,6 @@ export default function App() {
       paused: st.activeId === segId ? false : st.paused,
       pausedPid: st.activeId === segId ? null : st.pausedPid,
       sheetSegId: null,
-      draftActivity: '',
     }));
   }
 
@@ -512,17 +497,20 @@ export default function App() {
   function patchActiveSeg(patch: Partial<Segment>) {
     setState((s) => ({ segments: s.segments.map((g) => (g.id === s.activeId ? { ...g, ...patch } : g)) }));
   }
-  /** Update the active booking's checklist and mirror it back to the linked ToDo. */
-  function applyActiveChecklist(updater: (cl: ChecklistItem[]) => ChecklistItem[]) {
+  /** Update a booking's checklist and mirror it back to the linked ToDo. */
+  function applyChecklist(getId: (s: AppState) => string | null, updater: (cl: ChecklistItem[]) => ChecklistItem[]) {
     setState((s) => {
-      const seg = s.activeId ? s.segments.find((g) => g.id === s.activeId) : null;
+      const id = getId(s);
+      const seg = id ? s.segments.find((g) => g.id === id) : null;
       if (!seg) return s;
       const newCl = updater((seg.checklist ?? []).map((c) => ({ ...c })));
-      const segments = s.segments.map((g) => (g.id === s.activeId ? { ...g, checklist: newCl } : g));
+      const segments = s.segments.map((g) => (g.id === id ? { ...g, checklist: newCl } : g));
       const todos = seg.todoId ? s.todos.map((t) => (t.id === seg.todoId ? { ...t, checklist: newCl } : t)) : s.todos;
       return { segments, todos };
     });
   }
+  const applyActiveChecklist = (u: (cl: ChecklistItem[]) => ChecklistItem[]) => applyChecklist((s) => s.activeId, u);
+  const applySheetChecklist = (u: (cl: ChecklistItem[]) => ChecklistItem[]) => applyChecklist((s) => s.sheetSegId, u);
   function setChecklistText(i: number, text: string) {
     applyActiveChecklist((cl) => {
       if (cl[i]) cl[i] = { ...cl[i], text };
@@ -579,7 +567,7 @@ export default function App() {
       const seg = s.segments.find((g) => g.id === s.activeId);
       const segments = s.segments.map((g) => (g.id === s.activeId ? { ...g, end: vNow } : g));
       if (seg && vNow - seg.start >= 1 && needsActivity(seg)) {
-        return { segments, activeId: null, paused: false, pausedPid: null, sheetSegId: seg.id, draftActivity: seg.activity || '', fillGap: null, tab: 'tasks' };
+        return { segments, activeId: null, paused: false, pausedPid: null, sheetSegId: seg.id, fillGap: null, tab: 'tasks' };
       }
       return { segments, activeId: null, paused: false, pausedPid: null, sheetSegId: null, fillGap: null, tab: 'tasks' };
     });
@@ -822,10 +810,13 @@ export default function App() {
           <ActivitySheet
             seg={sheetSeg}
             project={sheetProj}
-            draftActivity={s.draftActivity}
-            onActivityInput={(v) => setState({ draftActivity: v })}
-            onSetTime={setTime}
-            onSave={saveActivity}
+            onSetStart={(m) => setTime('start', m)}
+            onSetEnd={(m) => setTime('end', m)}
+            onSetActivity={setSheetActivity}
+            onChecklistText={(i, t) => applySheetChecklist((cl) => { if (cl[i]) cl[i] = { ...cl[i], text: t }; return cl; })}
+            onChecklistToggle={(i) => applySheetChecklist((cl) => { if (cl[i]) cl[i] = { ...cl[i], done: !cl[i].done }; return cl; })}
+            onChecklistAdd={() => applySheetChecklist((cl) => cl.concat([{ text: '', done: false }]))}
+            onChecklistMove={(i, dir) => applySheetChecklist((cl) => moveItem(cl, i, dir))}
             onClose={closeSheet}
             onDelete={() => deleteSegment(sheetSeg.id)}
             key={sheetSeg.id}
@@ -866,8 +857,113 @@ export default function App() {
   );
 }
 
-/* ======================= BUCHUNGEN ======================= */
-function TrackView(props: {
+/* ===== shared detail form (Start/Zeit, Beschreibung, Aufgaben) ===== */
+/** The editable body of a booking detail: start + a second time field, the
+ *  description and the subtask checklist. Rendered both inline for the running
+ *  booking (TrackView) and inside the end-of-booking sheet (ActivitySheet),
+ *  so both masks look and behave identically. */
+function BookingDetailFields(props: {
+  seg: Segment;
+  textColor: string;
+  mutedColor: string;
+  secondTimeLabel: string;
+  secondTimeValue: number | null;
+  secondTimeNullable: boolean;
+  onSetStart: (min: number) => void;
+  onSetSecondTime: (min: number | null) => void;
+  onSetActivity: (text: string) => void;
+  onChecklistText: (i: number, text: string) => void;
+  onChecklistToggle: (i: number) => void;
+  onChecklistAdd: () => void;
+  onChecklistMove: (i: number, dir: -1 | 1) => void;
+}) {
+  const {
+    seg, textColor, mutedColor, secondTimeLabel, secondTimeValue, secondTimeNullable,
+    onSetStart, onSetSecondTime, onSetActivity,
+    onChecklistText, onChecklistToggle, onChecklistAdd, onChecklistMove,
+  } = props;
+  const timeInput: CSSProperties = { border: 'none', padding: '5px 8px', fontSize: 13, color: C.dk1, background: C.lt1, fontVariantNumeric: 'tabular-nums' };
+  const sectionLabel: CSSProperties = { fontSize: 11, letterSpacing: '.1em', textTransform: 'uppercase', color: mutedColor, fontWeight: 700, margin: '14px 0 8px' };
+  return (
+    <>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 12, color: mutedColor }}>Start</span>
+          <input
+            type="time"
+            value={fmtClock(seg.start)}
+            onChange={(e) => {
+              const v = e.target.value;
+              if (!v) return;
+              const [h, m] = v.split(':').map(Number);
+              onSetStart(h * 60 + m);
+            }}
+            style={timeInput}
+          />
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span style={{ fontSize: 12, color: mutedColor }}>{secondTimeLabel}</span>
+          <input
+            type="time"
+            value={secondTimeValue != null ? fmtClock(secondTimeValue) : ''}
+            onChange={(e) => {
+              const v = e.target.value;
+              if (!v) return secondTimeNullable ? onSetSecondTime(null) : undefined;
+              const [h, m] = v.split(':').map(Number);
+              onSetSecondTime(h * 60 + m);
+            }}
+            style={timeInput}
+          />
+        </div>
+      </div>
+
+      <div style={sectionLabel}>Beschreibung</div>
+      <textarea
+        value={seg.activity}
+        onChange={(e) => onSetActivity(e.target.value)}
+        placeholder="Was wird gemacht? …"
+        rows={2}
+        style={{ width: '100%', resize: 'vertical', border: 'none', padding: '8px 10px', fontSize: 14, lineHeight: 1.4, color: C.dk1, background: C.lt1, outline: 'none', fontFamily: 'inherit' }}
+      />
+
+      <div style={sectionLabel}>Aufgaben</div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        {(seg.checklist ?? []).map((it, i, arr) => (
+          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <input
+              type="checkbox"
+              checked={it.done}
+              onChange={() => onChecklistToggle(i)}
+              style={{ width: 18, height: 18, flex: '0 0 auto' }}
+            />
+            <input
+              type="text"
+              value={it.text}
+              onChange={(e) => onChecklistText(i, e.target.value)}
+              placeholder="Subaktivität …"
+              style={{ flex: '1 1 auto', minWidth: 0, border: 'none', padding: '7px 9px', fontSize: 14, color: C.dk1, background: C.lt1, textDecoration: it.done ? 'line-through' : 'none' }}
+            />
+            <button type="button" onClick={() => onChecklistMove(i, -1)} disabled={i === 0} style={moveBtnStyle(textColor, 'rgba(255,255,255,.18)', i === 0)}>
+              ▲
+            </button>
+            <button type="button" onClick={() => onChecklistMove(i, 1)} disabled={i === arr.length - 1} style={moveBtnStyle(textColor, 'rgba(255,255,255,.18)', i === arr.length - 1)}>
+              ▼
+            </button>
+          </div>
+        ))}
+      </div>
+      <button
+        type="button"
+        onClick={onChecklistAdd}
+        style={{ marginTop: 8, padding: '6px 12px', background: 'rgba(255,255,255,.18)', color: textColor, fontSize: 13, fontWeight: 700 }}
+      >
+        + Aufgabe
+      </button>
+    </>
+  );
+}
+
+/* ======================= BUCHUNGEN ======================= */function TrackView(props: {
   state: AppState;
   running: boolean;
   activeSeg: Segment | null;
@@ -1023,83 +1119,21 @@ function TrackView(props: {
 
         {running && activeSeg && (
           <div style={{ marginTop: 14, borderTop: '1px solid rgba(255,255,255,.25)', paddingTop: 12 }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, flexWrap: 'wrap' }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <span style={{ fontSize: 12, color: bannerMutedColor }}>Start</span>
-                <input
-                  type="time"
-                  value={fmtClock(activeSeg.start)}
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    if (!v) return;
-                    const [h, m] = v.split(':').map(Number);
-                    onSetStart(h * 60 + m);
-                  }}
-                  style={{ border: 'none', padding: '5px 8px', fontSize: 13, color: C.dk1, background: C.lt1, fontVariantNumeric: 'tabular-nums' }}
-                />
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <span style={{ fontSize: 12, color: bannerMutedColor }}>Geplantes Ende</span>
-                <input
-                  type="time"
-                  value={activeSeg.plannedEnd != null ? fmtClock(activeSeg.plannedEnd) : ''}
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    if (!v) return onSetPlannedEnd(null);
-                    const [h, m] = v.split(':').map(Number);
-                    onSetPlannedEnd(h * 60 + m);
-                  }}
-                  style={{ border: 'none', padding: '5px 8px', fontSize: 13, color: C.dk1, background: C.lt1, fontVariantNumeric: 'tabular-nums' }}
-                />
-              </div>
-            </div>
-
-            <div style={{ fontSize: 11, letterSpacing: '.1em', textTransform: 'uppercase', color: bannerMutedColor, fontWeight: 700, margin: '14px 0 8px' }}>
-              Beschreibung
-            </div>
-            <textarea
-              value={activeSeg.activity}
-              onChange={(e) => onSetActivity(e.target.value)}
-              placeholder="Was wird gemacht? …"
-              rows={2}
-              style={{ width: '100%', resize: 'vertical', border: 'none', padding: '8px 10px', fontSize: 14, lineHeight: 1.4, color: C.dk1, background: C.lt1, outline: 'none', fontFamily: 'inherit' }}
+            <BookingDetailFields
+              seg={activeSeg}
+              textColor={bannerTextColor}
+              mutedColor={bannerMutedColor}
+              secondTimeLabel="Geplantes Ende"
+              secondTimeValue={activeSeg.plannedEnd ?? null}
+              secondTimeNullable={true}
+              onSetStart={onSetStart}
+              onSetSecondTime={onSetPlannedEnd}
+              onSetActivity={onSetActivity}
+              onChecklistText={onChecklistText}
+              onChecklistToggle={onChecklistToggle}
+              onChecklistAdd={onChecklistAdd}
+              onChecklistMove={onChecklistMove}
             />
-
-            <div style={{ fontSize: 11, letterSpacing: '.1em', textTransform: 'uppercase', color: bannerMutedColor, fontWeight: 700, margin: '14px 0 8px' }}>
-              Aufgaben
-            </div>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-              {(activeSeg.checklist ?? []).map((it, i, arr) => (
-                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                  <input
-                    type="checkbox"
-                    checked={it.done}
-                    onChange={() => onChecklistToggle(i)}
-                    style={{ width: 18, height: 18, flex: '0 0 auto' }}
-                  />
-                  <input
-                    type="text"
-                    value={it.text}
-                    onChange={(e) => onChecklistText(i, e.target.value)}
-                    placeholder="Subaktivität …"
-                    style={{ flex: '1 1 auto', minWidth: 0, border: 'none', padding: '7px 9px', fontSize: 14, color: C.dk1, background: C.lt1, textDecoration: it.done ? 'line-through' : 'none' }}
-                  />
-                  <button type="button" onClick={() => onChecklistMove(i, -1)} disabled={i === 0} style={moveBtnStyle(bannerTextColor, 'rgba(255,255,255,.18)', i === 0)}>
-                    ▲
-                  </button>
-                  <button type="button" onClick={() => onChecklistMove(i, 1)} disabled={i === arr.length - 1} style={moveBtnStyle(bannerTextColor, 'rgba(255,255,255,.18)', i === arr.length - 1)}>
-                    ▼
-                  </button>
-                </div>
-              ))}
-            </div>
-            <button
-              type="button"
-              onClick={onChecklistAdd}
-              style={{ marginTop: 8, padding: '6px 12px', background: 'rgba(255,255,255,.18)', color: bannerTextColor, fontSize: 13, fontWeight: 700 }}
-            >
-              + Aufgabe
-            </button>
 
             <div style={{ display: 'flex', gap: 10, marginTop: 14 }}>
               <button
@@ -1814,20 +1848,22 @@ function BottomNav({ tab, onSelect }: { tab: Tab; onSelect: (t: Tab) => void }) 
 function ActivitySheet(props: {
   seg: Segment;
   project: Project;
-  draftActivity: string;
-  onActivityInput: (v: string) => void;
-  onSetTime: (edge: 'start' | 'end', total: number) => void;
-  onSave: () => void;
+  onSetStart: (min: number) => void;
+  onSetEnd: (min: number) => void;
+  onSetActivity: (text: string) => void;
+  onChecklistText: (i: number, text: string) => void;
+  onChecklistToggle: (i: number) => void;
+  onChecklistAdd: () => void;
+  onChecklistMove: (i: number, dir: -1 | 1) => void;
   onClose: () => void;
   onDelete: () => void;
 }) {
-  const { seg, project, draftActivity, onActivityInput, onSetTime, onSave, onClose, onDelete } = props;
+  const { seg, project, onSetStart, onSetEnd, onSetActivity, onChecklistText, onChecklistToggle, onChecklistAdd, onChecklistMove, onClose, onDelete } = props;
   const [confirmDelete, setConfirmDelete] = useState(false);
   const tc = textOn(project.color);
   const dark = tc === C.dk1;
   const muted = dark ? 'rgba(14,23,33,.6)' : 'rgba(255,255,255,.72)';
   const grab = dark ? 'rgba(14,23,33,.22)' : 'rgba(255,255,255,.45)';
-  const range = fmtClock(seg.start) + '–' + fmtClock(seg.end) + ' (' + fmtDur(seg.end - seg.start) + ' h)';
 
   return (
     <div
@@ -1836,47 +1872,48 @@ function ActivitySheet(props: {
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        style={{ width: '100%', background: C.lt1, animation: 'tkRise .26s cubic-bezier(.16,.84,.44,1)', boxShadow: '0 -8px 30px rgba(14,23,33,.2)' }}
+        style={{ width: '100%', maxHeight: '92dvh', overflowY: 'auto', background: project.color, padding: '14px 20px 22px', animation: 'tkRise .26s cubic-bezier(.16,.84,.44,1)', boxShadow: '0 -8px 30px rgba(14,23,33,.2)' }}
       >
-        <div style={{ background: project.color, padding: '14px 20px 18px' }}>
-          <div style={{ width: 38, height: 4, background: grab, margin: '0 auto 16px' }} />
-          <div style={{ fontSize: 11, letterSpacing: '.12em', textTransform: 'uppercase', fontWeight: 700, color: muted }}>
-            <span style={{ color: tc }}>{project.code}</span> &nbsp;|&nbsp; {range}
+        <div style={{ width: 38, height: 4, background: grab, margin: '0 auto 14px' }} />
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 14 }}>
+          <div style={{ minWidth: 0 }}>
+            <div style={{ fontSize: 11, letterSpacing: '.14em', textTransform: 'uppercase', fontWeight: 700, color: muted }}>Beendet</div>
+            <div style={{ fontSize: 19, fontWeight: 700, color: tc, marginTop: 4, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {project.code + '  ·  ' + project.name}
+            </div>
           </div>
-          <div style={{ fontSize: 24, fontWeight: 700, color: tc, marginTop: 5, lineHeight: 1.12 }}>{project.name}</div>
-          <div style={{ fontSize: 14, fontWeight: 500, color: muted, marginTop: 6 }}>Was hast du gemacht?</div>
+          <div style={{ textAlign: 'right', flex: '0 0 auto' }}>
+            <div style={{ fontSize: 34, fontWeight: 300, color: tc, fontVariantNumeric: 'tabular-nums', lineHeight: 1 }}>{fmtDur(seg.end - seg.start)}</div>
+            <div style={{ fontSize: 10, letterSpacing: '.12em', textTransform: 'uppercase', color: muted }}>Std : Min</div>
+          </div>
         </div>
-        <div style={{ padding: '18px 20px 24px' }}>
-          <div style={{ fontSize: 11, letterSpacing: '.12em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700, marginBottom: 14 }}>
-            Zeit anpassen
-          </div>
-          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'center', gap: 16 }}>
-            <TimePicker edge="start" total={seg.start} color={project.color} onChange={(t) => onSetTime('start', t)} />
-            <TimePicker edge="end" total={seg.end} color={project.color} onChange={(t) => onSetTime('end', t)} />
-          </div>
-          <div style={{ textAlign: 'center', fontSize: 12, color: C.greyFooter, margin: '12px 0 20px' }}>
-            Dauer <span style={{ fontWeight: 700, color: C.dk1 }}>{fmtDur(seg.end - seg.start) + ' h'}</span> &nbsp;·&nbsp; Räder zum Einstellen wischen
-          </div>
 
-          <div style={{ fontSize: 11, letterSpacing: '.12em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700, marginBottom: 10 }}>
-            Tätigkeit
-          </div>
-          <textarea
-            value={draftActivity}
-            onChange={(e) => onActivityInput(e.target.value)}
-            placeholder="Tätigkeiten dieser Buchung erfassen …"
-            style={{ width: '100%', height: 88, resize: 'none', border: '1px solid #D5DBDF', padding: '12px 13px', fontSize: 15, lineHeight: 1.45, color: C.dk1, outline: 'none', background: C.lt2 }}
+        <div style={{ marginTop: 14, borderTop: '1px solid rgba(255,255,255,.25)', paddingTop: 12 }}>
+          <BookingDetailFields
+            seg={seg}
+            textColor={tc}
+            mutedColor={muted}
+            secondTimeLabel="Ende"
+            secondTimeValue={seg.end}
+            secondTimeNullable={false}
+            onSetStart={onSetStart}
+            onSetSecondTime={(m) => { if (m != null) onSetEnd(m); }}
+            onSetActivity={onSetActivity}
+            onChecklistText={onChecklistText}
+            onChecklistToggle={onChecklistToggle}
+            onChecklistAdd={onChecklistAdd}
+            onChecklistMove={onChecklistMove}
           />
-          <div style={{ display: 'flex', gap: 10, marginTop: 16 }}>
-            <button type="button" onClick={onClose} style={{ flex: 1, padding: 13, background: C.lt2, color: C.dk1, fontSize: 14, fontWeight: 700 }}>
-              Schließen
-            </button>
-            <button type="button" onClick={onSave} style={{ flex: 2, padding: 13, background: project.color, color: tc, fontSize: 14, fontWeight: 700 }}>
-              Speichern
-            </button>
-          </div>
+
+          <button
+            type="button"
+            onClick={onClose}
+            style={{ width: '100%', marginTop: 14, padding: 12, background: 'rgba(255,255,255,.18)', color: tc, fontSize: 14, fontWeight: 700, letterSpacing: '.04em', textTransform: 'uppercase' }}
+          >
+            Schließen
+          </button>
           {confirmDelete ? (
-            <div style={{ marginTop: 12, padding: '12px 13px', background: '#FBE9F0', border: '1px solid ' + C.critical }}>
+            <div style={{ marginTop: 10, padding: '12px 13px', background: C.lt1, border: '1px solid ' + C.critical }}>
               <div style={{ fontSize: 13, color: C.dk1, fontWeight: 500, marginBottom: 10 }}>Diese Buchung wirklich löschen?</div>
               <div style={{ display: 'flex', gap: 10 }}>
                 <button
@@ -1899,7 +1936,7 @@ function ActivitySheet(props: {
             <button
               type="button"
               onClick={() => setConfirmDelete(true)}
-              style={{ width: '100%', marginTop: 10, padding: 11, background: 'transparent', color: C.critical, fontSize: 13, fontWeight: 700, letterSpacing: '.04em' }}
+              style={{ width: '100%', marginTop: 10, padding: 11, background: 'transparent', color: tc, fontSize: 13, fontWeight: 700, letterSpacing: '.04em', opacity: 0.85 }}
             >
               Eintrag löschen
             </button>

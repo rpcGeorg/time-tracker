@@ -87,7 +87,7 @@ function dataSignature(projects: Project[], segments: Segment[], todos: Todo[]):
   return JSON.stringify({
     p: projects.map((p) => [p.id, p.code, p.name, p.color]),
     s: segments.map((s) => [s.id, s.pid, s.start, s.end, s.activity, s.plannedEnd ?? null, s.checklist ?? [], s.todoId ?? null]),
-    t: todos.map((t) => [t.id, t.title, t.category, t.projectId, t.plannedMin, t.urgency, t.importance, t.drawing, t.zug, t.archived]),
+    t: todos.map((t) => [t.id, t.title, t.category, t.projectId, t.plannedMin, t.urgency, t.importance, t.drawing, t.zug, t.archived, t.checklist ?? []]),
   });
 }
 
@@ -467,11 +467,8 @@ export default function App() {
       }
       const id = 'u' + Date.now();
       const plannedEnd = todo.plannedMin > 0 ? Math.min(24 * 60, vNow + todo.plannedMin) : null;
-      const checklist: ChecklistItem[] = [
-        { text: todo.title, done: false },
-        { text: '', done: false },
-        { text: '', done: false },
-      ];
+      // carry the ToDo's own activity checklist into the booking detail
+      const checklist: ChecklistItem[] = todo.checklist && todo.checklist.length ? todo.checklist.map((c) => ({ ...c })) : emptyChecklist();
       segments.push({ id, pid, start: vNow, end: vNow, activity: todo.title, plannedEnd, checklist, todoId: todo.id });
       return { segments, activeId: id, paused: false, pausedPid: null, sheetSegId: null, fillGap: null, tab: 'track' };
     });
@@ -481,31 +478,31 @@ export default function App() {
   function patchActiveSeg(patch: Partial<Segment>) {
     setState((s) => ({ segments: s.segments.map((g) => (g.id === s.activeId ? { ...g, ...patch } : g)) }));
   }
-  function activeChecklist(s: AppState): ChecklistItem[] {
-    const seg = s.activeId ? s.segments.find((g) => g.id === s.activeId) : null;
-    return (seg?.checklist ?? []).slice();
+  /** Update the active booking's checklist and mirror it back to the linked ToDo. */
+  function applyActiveChecklist(updater: (cl: ChecklistItem[]) => ChecklistItem[]) {
+    setState((s) => {
+      const seg = s.activeId ? s.segments.find((g) => g.id === s.activeId) : null;
+      if (!seg) return s;
+      const newCl = updater((seg.checklist ?? []).map((c) => ({ ...c })));
+      const segments = s.segments.map((g) => (g.id === s.activeId ? { ...g, checklist: newCl } : g));
+      const todos = seg.todoId ? s.todos.map((t) => (t.id === seg.todoId ? { ...t, checklist: newCl } : t)) : s.todos;
+      return { segments, todos };
+    });
   }
   function setChecklistText(i: number, text: string) {
-    setState((s) => {
-      const cl = activeChecklist(s);
-      if (!cl[i]) return s;
-      cl[i] = { ...cl[i], text };
-      return { segments: s.segments.map((g) => (g.id === s.activeId ? { ...g, checklist: cl } : g)) };
+    applyActiveChecklist((cl) => {
+      if (cl[i]) cl[i] = { ...cl[i], text };
+      return cl;
     });
   }
   function toggleChecklistItem(i: number) {
-    setState((s) => {
-      const cl = activeChecklist(s);
-      if (!cl[i]) return s;
-      cl[i] = { ...cl[i], done: !cl[i].done };
-      return { segments: s.segments.map((g) => (g.id === s.activeId ? { ...g, checklist: cl } : g)) };
+    applyActiveChecklist((cl) => {
+      if (cl[i]) cl[i] = { ...cl[i], done: !cl[i].done };
+      return cl;
     });
   }
   function addChecklistRow() {
-    setState((s) => {
-      const cl = activeChecklist(s).concat([{ text: '', done: false }]);
-      return { segments: s.segments.map((g) => (g.id === s.activeId ? { ...g, checklist: cl } : g)) };
-    });
+    applyActiveChecklist((cl) => cl.concat([{ text: '', done: false }]));
   }
   function setPlannedEnd(min: number | null) {
     patchActiveSeg({ plannedEnd: min });
@@ -2021,6 +2018,16 @@ function DailyTasksView(props: {
                 <tr key={t.id} onClick={() => onEdit(t)} style={{ cursor: 'pointer', borderBottom: '1px solid #EAEDEF', background: t.zug ? ZUG_ROW_BG : undefined }}>
                   <td style={{ ...taskCellStyle, color: C.dk1, fontWeight: 700 }}>
                     {t.title}
+                    {(() => {
+                      const items = (t.checklist ?? []).filter((c) => c.text.trim() !== '');
+                      if (items.length === 0) return null;
+                      const done = items.filter((c) => c.done).length;
+                      return (
+                        <div style={{ fontSize: 11, fontWeight: 500, color: C.muted, marginTop: 2 }}>
+                          ✓ {done}/{items.length}
+                        </div>
+                      );
+                    })()}
                     {t.drawing && (
                       <img
                         src={t.drawing}
@@ -2141,6 +2148,9 @@ function TodoSheet(props: {
   const [importance, setImportance] = useState(initial?.importance ?? 2);
   const [drawing, setDrawing] = useState<string | null>(initial?.drawing ?? null);
   const [zug, setZug] = useState<boolean>(initial?.zug ?? false);
+  const [checklist, setChecklist] = useState<ChecklistItem[]>(
+    initial?.checklist && initial.checklist.length ? initial.checklist.map((c) => ({ ...c })) : emptyChecklist(),
+  );
   const [confirmDelete, setConfirmDelete] = useState(false);
   // a task can be saved as soon as it has a title OR a sketch (drawing-only = provisional)
   const canSave = title.trim().length > 0 || !!drawing;
@@ -2157,6 +2167,7 @@ function TodoSheet(props: {
       drawing,
       zug,
       archived: initial?.archived ?? false,
+      checklist,
     };
   }
   function save() {
@@ -2207,6 +2218,34 @@ function TodoSheet(props: {
           <div style={{ fontSize: 11, color: C.muted, marginTop: 6 }}>
             Ohne Titel wird die Aufgabe als „vorläufig" gespeichert und kann später konkretisiert werden.
           </div>
+
+          {label('Aktivitäten')}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {checklist.map((it, i) => (
+              <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <input
+                  type="checkbox"
+                  checked={it.done}
+                  onChange={() => setChecklist((cl) => cl.map((c, idx) => (idx === i ? { ...c, done: !c.done } : c)))}
+                  style={{ width: 18, height: 18, flex: '0 0 auto' }}
+                />
+                <input
+                  type="text"
+                  value={it.text}
+                  onChange={(e) => setChecklist((cl) => cl.map((c, idx) => (idx === i ? { ...c, text: e.target.value } : c)))}
+                  placeholder="Subaktivität …"
+                  style={{ flex: '1 1 auto', minWidth: 0, border: '1px solid #D5DBDF', padding: '8px 10px', fontSize: 14, color: C.dk1, background: C.lt2, outline: 'none', textDecoration: it.done ? 'line-through' : 'none', userSelect: 'text', WebkitUserSelect: 'text' }}
+                />
+              </div>
+            ))}
+          </div>
+          <button
+            type="button"
+            onClick={() => setChecklist((cl) => cl.concat([{ text: '', done: false }]))}
+            style={{ marginTop: 8, padding: '7px 12px', background: C.lt2, color: C.dk1, fontSize: 12, fontWeight: 700 }}
+          >
+            + Aktivität
+          </button>
 
           {label('Kategorie')}
           <div style={{ display: 'flex', gap: 8 }}>

@@ -1135,18 +1135,25 @@ function BookingDetailFields(props: {
               onChecklistMove={onChecklistMove}
             />
 
-            <div style={{ display: 'flex', gap: 10, marginTop: 14 }}>
+            {needsActivity(activeSeg) && (
+              <div style={{ fontSize: 12, color: bannerMutedColor, marginTop: 14 }}>
+                Bitte zuerst eine Beschreibung oder eine Aufgabe erfassen, um die Buchung abzuschließen.
+              </div>
+            )}
+            <div style={{ display: 'flex', gap: 10, marginTop: needsActivity(activeSeg) ? 8 : 14 }}>
               <button
                 type="button"
                 onClick={onCloseBooking}
-                style={{ flex: 1, padding: 12, background: 'rgba(255,255,255,.18)', color: bannerTextColor, fontSize: 14, fontWeight: 700, letterSpacing: '.04em', textTransform: 'uppercase' }}
+                disabled={needsActivity(activeSeg)}
+                style={{ flex: 1, padding: 12, background: 'rgba(255,255,255,.18)', color: bannerTextColor, fontSize: 14, fontWeight: 700, letterSpacing: '.04em', textTransform: 'uppercase', opacity: needsActivity(activeSeg) ? 0.4 : 1, cursor: needsActivity(activeSeg) ? 'not-allowed' : 'pointer' }}
               >
                 Schließen
               </button>
               <button
                 type="button"
                 onClick={onComplete}
-                style={{ flex: 1, padding: 12, background: C.lt1, color: C.accent1, fontSize: 14, fontWeight: 700, letterSpacing: '.04em', textTransform: 'uppercase' }}
+                disabled={needsActivity(activeSeg)}
+                style={{ flex: 1, padding: 12, background: C.lt1, color: C.accent1, fontSize: 14, fontWeight: 700, letterSpacing: '.04em', textTransform: 'uppercase', opacity: needsActivity(activeSeg) ? 0.4 : 1, cursor: needsActivity(activeSeg) ? 'not-allowed' : 'pointer' }}
               >
                 Erledigt
               </button>
@@ -1864,10 +1871,11 @@ function ActivitySheet(props: {
   const dark = tc === C.dk1;
   const muted = dark ? 'rgba(14,23,33,.6)' : 'rgba(255,255,255,.72)';
   const grab = dark ? 'rgba(14,23,33,.22)' : 'rgba(255,255,255,.45)';
+  const blocked = needsActivity(seg); // can't close until a description or subtask exists
 
   return (
     <div
-      onClick={onClose}
+      onClick={() => { if (!blocked) onClose(); }}
       style={{ position: 'absolute', inset: 0, background: 'rgba(14,23,33,.4)', zIndex: 30, display: 'flex', alignItems: 'flex-end', animation: 'tkFade .18s ease' }}
     >
       <div
@@ -1905,10 +1913,16 @@ function ActivitySheet(props: {
             onChecklistMove={onChecklistMove}
           />
 
+          {blocked && (
+            <div style={{ fontSize: 12, color: muted, marginTop: 14 }}>
+              Bitte zuerst eine Beschreibung oder eine Aufgabe erfassen, um die Buchung abzuschließen.
+            </div>
+          )}
           <button
             type="button"
             onClick={onClose}
-            style={{ width: '100%', marginTop: 14, padding: 12, background: 'rgba(255,255,255,.18)', color: tc, fontSize: 14, fontWeight: 700, letterSpacing: '.04em', textTransform: 'uppercase' }}
+            disabled={blocked}
+            style={{ width: '100%', marginTop: blocked ? 8 : 14, padding: 12, background: 'rgba(255,255,255,.18)', color: tc, fontSize: 14, fontWeight: 700, letterSpacing: '.04em', textTransform: 'uppercase', opacity: blocked ? 0.4 : 1, cursor: blocked ? 'not-allowed' : 'pointer' }}
           >
             Schließen
           </button>

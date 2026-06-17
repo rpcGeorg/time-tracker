@@ -69,6 +69,7 @@ create table if not exists public.todos (
   drawing     text,                                    -- optional hand-drawn sketch (PNG data URL)
   zug         boolean not null default false,          -- can be done "on the train"
   archived    boolean not null default false,          -- hidden from lists after "Erledigt"
+  checklist   jsonb not null default '[]'::jsonb,       -- sub-activities (synced with booking detail)
   created_at  timestamptz not null default now()
 );
 
@@ -76,6 +77,7 @@ create table if not exists public.todos (
 alter table public.todos add column if not exists drawing text;
 alter table public.todos add column if not exists zug boolean not null default false;
 alter table public.todos add column if not exists archived boolean not null default false;
+alter table public.todos add column if not exists checklist jsonb not null default '[]'::jsonb;
 
 create index if not exists todos_user_idx on public.todos (user_id, created_at);
 

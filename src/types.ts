@@ -57,6 +57,8 @@ export interface Todo {
   zug: boolean;
   /** archived (e.g. after "Erledigt") – kept in storage but hidden from lists */
   archived: boolean;
+  /** sub-activities; carried into the booking detail and kept in sync with it */
+  checklist: ChecklistItem[];
 }
 export type TileLayout = 'grid' | 'sized' | 'list';
 export type ReportPeriod = 'heute' | 'woche' | 'monat' | 'jahr' | 'zeitraum';

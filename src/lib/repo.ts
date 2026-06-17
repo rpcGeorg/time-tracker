@@ -147,6 +147,7 @@ interface DbTodo {
   drawing?: string | null;
   zug?: boolean | null;
   archived?: boolean | null;
+  checklist?: ChecklistItem[] | null;
 }
 
 export async function loadTodos(): Promise<Todo[]> {
@@ -165,6 +166,7 @@ export async function loadTodos(): Promise<Todo[]> {
     drawing: t.drawing ?? null,
     zug: t.zug ?? false,
     archived: t.archived ?? false,
+    checklist: t.checklist ?? [],
   }));
 }
 
@@ -192,6 +194,7 @@ export async function syncTodos(todos: Todo[]): Promise<void> {
         drawing: t.drawing,
         zug: t.zug,
         archived: t.archived,
+        checklist: t.checklist ?? [],
       })),
     );
     if (error) throw error;

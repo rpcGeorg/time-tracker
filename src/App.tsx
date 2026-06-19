@@ -192,6 +192,9 @@ export default function App() {
   // Bookings for the active Reporting range (Woche/Monat/Jahr/Zeitraum). Today's
   // live bookings are merged in at render time, so only past days are fetched here.
   const [reportSegments, setReportSegments] = useState<DaySegment[]>([]);
+  // Archive (completed tasks) time-slice filter + the bookings fetched for it.
+  const [archivePeriod, setArchivePeriod] = useState<ReportPeriod>('monat');
+  const [archiveSegments, setArchiveSegments] = useState<DaySegment[]>([]);
 
   // Daily-Tasks editor sheet: null = closed, 'new' = create, Todo = edit.
   const [todoSheet, setTodoSheet] = useState<Todo | 'new' | null>(null);
@@ -318,6 +321,30 @@ export default function App() {
       active = false;
     };
   }, [state.tab, state.reportPeriod, state.custFrom, state.custTo, userEmail, dataLoaded]);
+
+  // Load bookings for the Archive's selected time slice (Woche/Monat/Jahr).
+  useEffect(() => {
+    if (state.tab !== 'archiv') return;
+    if (!isSupabaseConfigured) {
+      setArchiveSegments([]); // local mode: only today (merged in at render)
+      return;
+    }
+    if (!userEmail || !dataLoaded) return;
+    const { from, to } = periodRange(archivePeriod, state.custFrom, state.custTo, new Date());
+    let active = true;
+    (async () => {
+      try {
+        const segs = await loadSegmentsRange(from, to);
+        if (active) setArchiveSegments(segs);
+      } catch (e) {
+        console.error('Supabase archive load failed', e);
+        if (active) setArchiveSegments([]);
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [state.tab, archivePeriod, userEmail, dataLoaded]);
 
   async function logout() {
     if (supabase) await supabase.auth.signOut();
@@ -666,6 +693,15 @@ export default function App() {
   const sheetSeg = s.sheetSegId ? s.segments.find((g) => g.id === s.sheetSegId) : null;
   const sheetProj = sheetSeg ? proj(sheetSeg.pid) : null;
 
+  // Bookings within the Archive's selected time slice (past days from the cloud,
+  // today's live bookings merged in), used to show time per completed task.
+  const archiveRange = periodRange(archivePeriod, s.custFrom, s.custTo, today);
+  const todayKey = localISODate();
+  const archiveDaySegments: DaySegment[] = [
+    ...archiveSegments.filter((seg) => seg.day !== todayKey),
+    ...s.segments.map((seg) => ({ ...seg, day: todayKey })),
+  ].filter((seg) => seg.day >= archiveRange.from && seg.day <= archiveRange.to);
+
   // ---------- render ----------
   if (isSupabaseConfigured && !authReady) return <LoadingScreen text="Lädt …" />;
   if (isSupabaseConfigured && !userEmail) return <Login />;
@@ -813,6 +849,9 @@ export default function App() {
           {isArchiv && (
             <ArchiveView
               state={s}
+              period={archivePeriod}
+              onSetPeriod={setArchivePeriod}
+              daySegments={archiveDaySegments}
               onEdit={(t) => setTodoSheet(t)}
               onRestore={unarchiveTodo}
             />
@@ -2331,23 +2370,97 @@ function DailyTasksView(props: {
 }
 
 /* ======================= ARCHIV ======================= */
-function ArchiveView(props: { state: AppState; onEdit: (t: Todo) => void; onRestore: (id: string) => void }) {
-  const { state: s, onEdit, onRestore } = props;
+/** German short day label from a YYYY-MM-DD key, e.g. "Mi., 17.06.". */
+function fmtDayShort(day: string): string {
+  const [y, m, d] = day.split('-').map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString('de-DE', { weekday: 'short', day: '2-digit', month: '2-digit' });
+}
+
+function ArchiveView(props: {
+  state: AppState;
+  period: ReportPeriod;
+  onSetPeriod: (p: ReportPeriod) => void;
+  daySegments: DaySegment[];
+  onEdit: (t: Todo) => void;
+  onRestore: (id: string) => void;
+}) {
+  const { state: s, period, onSetPeriod, daySegments, onEdit, onRestore } = props;
   const archived = s.todos.filter((t) => t.archived);
+  const archivedIds = new Set(archived.map((t) => t.id));
+
+  // group the slice's bookings by the (archived) task they belong to
+  const byTodo = new Map<string, DaySegment[]>();
+  for (const seg of daySegments) {
+    if (!seg.todoId || !archivedIds.has(seg.todoId)) continue;
+    const arr = byTodo.get(seg.todoId);
+    if (arr) arr.push(seg);
+    else byTodo.set(seg.todoId, [seg]);
+  }
+  const totalMin = [...byTodo.values()].flat().reduce((a, seg) => a + Math.max(0, seg.end - seg.start), 0);
+
+  const summary = (t: Todo) => {
+    const segs = byTodo.get(t.id);
+    if (!segs || segs.length === 0) return null;
+    const dur = segs.reduce((a, x) => a + Math.max(0, x.end - x.start), 0);
+    const days = [...new Set(segs.map((x) => x.day))].sort();
+    const start = Math.min(...segs.map((x) => x.start));
+    const end = Math.max(...segs.map((x) => x.end));
+    return { dur, days, start, end };
+  };
+
+  const periodDefs: [ReportPeriod, string][] = [
+    ['woche', 'Woche'],
+    ['monat', 'Monat'],
+    ['jahr', 'Jahr'],
+  ];
+
+  // tasks with time in the slice first (newest), then the rest
+  const withTime = archived.filter((t) => byTodo.has(t.id));
+  const withoutTime = archived.filter((t) => !byTodo.has(t.id));
+  withTime.sort((a, b) => {
+    const sa = summary(a)!;
+    const sb = summary(b)!;
+    const da = sa.days[sa.days.length - 1];
+    const db = sb.days[sb.days.length - 1];
+    if (da !== db) return da < db ? 1 : -1;
+    return sb.start - sa.start;
+  });
+  const ordered = [...withTime, ...withoutTime];
+
   return (
     <section style={{ padding: '18px 20px 36px' }}>
-      <div style={{ marginBottom: 16 }}>
-        <div style={{ fontSize: 11, letterSpacing: '.14em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700 }}>Archiv</div>
-        <div style={{ fontSize: 13, color: C.greyFooter, marginTop: 3 }}>Erledigte Aufgaben ({archived.length})</div>
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 14, marginBottom: 16 }}>
+        <div>
+          <div style={{ fontSize: 11, letterSpacing: '.14em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700 }}>Archiv</div>
+          <div style={{ fontSize: 13, color: C.greyFooter, marginTop: 3 }}>Erledigte Aufgaben ({archived.length})</div>
+        </div>
+        <div style={{ textAlign: 'right', flex: '0 0 auto' }}>
+          <div style={{ fontSize: 28, fontWeight: 300, color: C.accent1, fontVariantNumeric: 'tabular-nums', lineHeight: 1 }}>{fmtDur(totalMin)}</div>
+          <div style={{ fontSize: 10, letterSpacing: '.1em', textTransform: 'uppercase', color: C.greyFooter }}>Std im Zeitraum</div>
+        </div>
+      </div>
+
+      <div style={{ display: 'flex', border: '1px solid #D5DBDF', background: C.lt2, marginBottom: 20, overflow: 'hidden' }}>
+        {periodDefs.map(([k, label]) => (
+          <button
+            key={k}
+            type="button"
+            onClick={() => onSetPeriod(k)}
+            style={{ flex: '1 1 auto', padding: '9px 4px', fontSize: 12, fontWeight: 700, textAlign: 'center', color: period === k ? C.lt1 : '#5E7184', background: period === k ? C.accent1 : 'transparent' }}
+          >
+            {label}
+          </button>
+        ))}
       </div>
 
       {archived.length === 0 ? (
         <div style={{ fontSize: 13, color: C.muted, padding: '8px 0' }}>Noch keine erledigten Aufgaben.</div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {archived.map((t) => {
+          {ordered.map((t) => {
             const items = (t.checklist ?? []).filter((c) => c.text.trim() !== '');
             const done = items.filter((c) => c.done).length;
+            const sum = summary(t);
             return (
               <div
                 key={t.id}
@@ -2362,6 +2475,14 @@ function ArchiveView(props: { state: AppState; onEdit: (t: Todo) => void; onRest
                     {CATEGORY_LABELS[t.category]}
                     {items.length > 0 && <span> &nbsp;·&nbsp; ✓ {done}/{items.length}</span>}
                   </div>
+                  {sum ? (
+                    <div style={{ fontSize: 12, color: C.accent1, fontWeight: 700, marginTop: 4, fontVariantNumeric: 'tabular-nums' }}>
+                      {fmtDayShort(sum.days[0])}
+                      {sum.days.length > 1 ? ' …' : ''} &nbsp;·&nbsp; {fmtClock(sum.start)}–{fmtClock(sum.end)} &nbsp;·&nbsp; {fmtDur(sum.dur)} h
+                    </div>
+                  ) : (
+                    <div style={{ fontSize: 12, color: C.muted, marginTop: 4 }}>Keine Buchung in diesem Zeitraum</div>
+                  )}
                 </div>
                 <button
                   type="button"

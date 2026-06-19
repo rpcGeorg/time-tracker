@@ -195,6 +195,8 @@ export default function App() {
 
   // Daily-Tasks editor sheet: null = closed, 'new' = create, Todo = edit.
   const [todoSheet, setTodoSheet] = useState<Todo | 'new' | null>(null);
+  // pending confirmation dialog (e.g. before archiving a task / completing a booking)
+  const [confirm, setConfirm] = useState<{ message: string; confirmLabel: string; onConfirm: () => void } | null>(null);
 
   const setState = (updater: Updater) =>
     setStateRaw((prev) => ({ ...prev, ...(typeof updater === 'function' ? updater(prev) : updater) }));
@@ -745,7 +747,13 @@ export default function App() {
               onSetStart={setActiveStart}
               onSetActivity={setActiveActivity}
               onSetPlannedEnd={setPlannedEnd}
-              onComplete={completeBooking}
+              onComplete={() =>
+                setConfirm({
+                  message: 'Buchung als erledigt abschließen und (falls verknüpft) die Aufgabe ins Archiv verschieben?',
+                  confirmLabel: 'Erledigt',
+                  onConfirm: completeBooking,
+                })
+              }
               onCloseBooking={closeBooking}
             />
           )}
@@ -772,7 +780,14 @@ export default function App() {
               onAdd={() => setTodoSheet('new')}
               onEdit={(t) => setTodoSheet(t)}
               onTake={takeTodoToProject}
-              onComplete={archiveTodo}
+              onComplete={(id) => {
+                const t = state.todos.find((x) => x.id === id);
+                setConfirm({
+                  message: `Aufgabe${t?.title ? ` „${t.title}“` : ''} ins Archiv verschieben?`,
+                  confirmLabel: 'Erledigt',
+                  onConfirm: () => archiveTodo(id),
+                });
+              }}
             />
           )}
 
@@ -841,6 +856,45 @@ export default function App() {
             onClose={() => setTodoSheet(null)}
           />
         )}
+
+        {/* Confirmation dialog (archive task / complete booking) */}
+        {confirm && (
+          <ConfirmDialog
+            message={confirm.message}
+            confirmLabel={confirm.confirmLabel}
+            onConfirm={() => {
+              confirm.onConfirm();
+              setConfirm(null);
+            }}
+            onCancel={() => setConfirm(null)}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ======================= CONFIRM DIALOG ======================= */
+function ConfirmDialog(props: { message: string; confirmLabel: string; onConfirm: () => void; onCancel: () => void }) {
+  const { message, confirmLabel, onConfirm, onCancel } = props;
+  return (
+    <div
+      onClick={onCancel}
+      style={{ position: 'absolute', inset: 0, background: 'rgba(14,23,33,.45)', zIndex: 40, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 24, animation: 'tkFade .18s ease' }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: '100%', maxWidth: 340, background: C.lt1, padding: '20px 20px 18px', boxShadow: '0 10px 40px rgba(14,23,33,.28)' }}
+      >
+        <div style={{ fontSize: 15, fontWeight: 700, color: C.dk1, lineHeight: 1.4 }}>{message}</div>
+        <div style={{ display: 'flex', gap: 10, marginTop: 18 }}>
+          <button type="button" onClick={onCancel} style={{ flex: 1, padding: 12, background: C.lt2, color: C.dk1, fontSize: 14, fontWeight: 700 }}>
+            Abbrechen
+          </button>
+          <button type="button" onClick={onConfirm} style={{ flex: 1, padding: 12, background: '#2E8B3D', color: C.lt1, fontSize: 14, fontWeight: 700 }}>
+            {confirmLabel}
+          </button>
+        </div>
       </div>
     </div>
   );

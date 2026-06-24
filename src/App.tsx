@@ -358,8 +358,11 @@ export default function App() {
       const name = s.draftName.trim();
       if (!code || !name) return s;
       const id = 'p' + Date.now();
+      // colour is no longer shown in the UI; assign one automatically so the
+      // (still required) field stays populated.
+      const color = PALETTE[s.projects.length % PALETTE.length];
       return {
-        projects: s.projects.concat([{ id, code, name, color: s.draftColor }]),
+        projects: s.projects.concat([{ id, code, name, color }]),
         draftCode: '',
         draftName: '',
       };
@@ -368,14 +371,6 @@ export default function App() {
 
   function updateProject(pid: string, field: 'code' | 'name', v: string) {
     setState((s) => ({ projects: s.projects.map((p) => (p.id === pid ? { ...p, [field]: v } : p)) }));
-  }
-
-  function cycleColor(pid: string) {
-    setState((s) => {
-      const p = s.projects.find((x) => x.id === pid)!;
-      const ni = (PALETTE.indexOf(p.color) + 1) % PALETTE.length;
-      return { projects: s.projects.map((x) => (x.id === pid ? { ...x, color: PALETTE[ni] } : x)) };
-    });
   }
 
   function deleteProject(pid: string) {
@@ -456,11 +451,6 @@ export default function App() {
   const today = new Date();
   const dateText = today.toLocaleDateString('de-DE', { weekday: 'short', day: 'numeric', month: 'long' });
   const clockText = fmtClock(vNow);
-
-  const totals: Record<string, number> = {};
-  s.projects.forEach((p) => {
-    totals[p.id] = s.segments.filter((g) => g.pid === p.id).reduce((a, g) => a + (g.end - g.start), 0);
-  });
 
   // The task whose focus countdown is currently running (if any).
   const runTodo = run ? s.todos.find((t) => t.id === run.todoId && !t.archived) ?? null : null;
@@ -579,8 +569,6 @@ export default function App() {
           {isAdmin && (
             <AdminView
               state={s}
-              totals={totals}
-              onCycleColor={cycleColor}
               onUpdateProject={updateProject}
               onDeleteProject={deleteProject}
               onSetDraft={(field, v) => setState({ [field]: v } as Partial<AppState>)}
@@ -888,16 +876,14 @@ function ReportView(props: {
 /* ======================= PFLEGE ======================= */
 function AdminView(props: {
   state: AppState;
-  totals: Record<string, number>;
-  onCycleColor: (pid: string) => void;
   onUpdateProject: (pid: string, field: 'code' | 'name', v: string) => void;
   onDeleteProject: (pid: string) => void;
-  onSetDraft: (field: 'draftCode' | 'draftName' | 'draftColor', v: string) => void;
+  onSetDraft: (field: 'draftCode' | 'draftName', v: string) => void;
   onAddProject: () => void;
   accountEmail: string | null;
   onLogout: () => void;
 }) {
-  const { state: s, totals, onCycleColor, onUpdateProject, onDeleteProject, onSetDraft, onAddProject, accountEmail, onLogout } = props;
+  const { state: s, onUpdateProject, onDeleteProject, onSetDraft, onAddProject, accountEmail, onLogout } = props;
   const canAdd = !!(s.draftCode.trim() && s.draftName.trim());
 
   return (
@@ -906,34 +892,29 @@ function AdminView(props: {
         Projekte verwalten
       </div>
       <p style={{ fontSize: 12, lineHeight: 1.5, color: C.greyFooter, margin: '0 0 18px' }}>
-        Code &amp; Name bearbeiten, Farbe per Tipp auf die Kachel wechseln. Jedes Projekt erscheint als Kachel in der Buchung.
+        Code &amp; Name der Projekte bearbeiten oder Projekte löschen.
       </p>
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-        {s.projects.map((p) => {
-          const used = totals[p.id] > 0;
-          return (
-            <div key={p.id} style={{ display: 'flex', alignItems: 'stretch', border: '1px solid #E1E5E8', background: C.lt1 }}>
-              <button type="button" title="Farbe wechseln" onClick={() => onCycleColor(p.id)} style={{ flex: '0 0 auto', width: 40, height: 40, background: p.color }} />
-              <div style={{ flex: '1 1 auto', minWidth: 0, padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 2 }}>
-                <input
-                  value={p.code}
-                  onChange={(e) => onUpdateProject(p.id, 'code', e.target.value)}
-                  style={{ border: 'none', outline: 'none', padding: 0, fontSize: 11, fontWeight: 700, letterSpacing: '.1em', textTransform: 'uppercase', color: C.greyFooter, background: 'transparent' }}
-                />
-                <input
-                  value={p.name}
-                  onChange={(e) => onUpdateProject(p.id, 'name', e.target.value)}
-                  style={{ border: 'none', outline: 'none', padding: 0, fontSize: 16, fontWeight: 700, color: C.dk1, background: 'transparent' }}
-                />
-                <span style={{ fontSize: 11, color: C.muted }}>{used ? fmtDur(totals[p.id]) + ' h heute' : 'noch keine Zeit'}</span>
-              </div>
-              <button type="button" title="Löschen" onClick={() => onDeleteProject(p.id)} style={{ flex: '0 0 auto', width: 46, color: C.muted, fontSize: 18 }}>
-                ×
-              </button>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {s.projects.map((p) => (
+          <div key={p.id} style={{ display: 'flex', alignItems: 'center', border: '1px solid #E1E5E8', background: C.lt1 }}>
+            <div style={{ flex: '1 1 auto', minWidth: 0, padding: '8px 12px', display: 'flex', flexDirection: 'column', gap: 2 }}>
+              <input
+                value={p.code}
+                onChange={(e) => onUpdateProject(p.id, 'code', e.target.value)}
+                style={{ border: 'none', outline: 'none', padding: 0, fontSize: 11, fontWeight: 700, letterSpacing: '.1em', textTransform: 'uppercase', color: C.greyFooter, background: 'transparent' }}
+              />
+              <input
+                value={p.name}
+                onChange={(e) => onUpdateProject(p.id, 'name', e.target.value)}
+                style={{ border: 'none', outline: 'none', padding: 0, fontSize: 16, fontWeight: 700, color: C.dk1, background: 'transparent' }}
+              />
             </div>
-          );
-        })}
+            <button type="button" title="Löschen" onClick={() => onDeleteProject(p.id)} style={{ flex: '0 0 auto', width: 46, alignSelf: 'stretch', color: C.muted, fontSize: 18 }}>
+              ×
+            </button>
+          </div>
+        ))}
       </div>
 
       <div style={{ marginTop: 24, borderTop: '2px solid #074771', paddingTop: 18 }}>
@@ -963,19 +944,6 @@ function AdminView(props: {
               style={{ width: '100%', border: '1px solid #D5DBDF', padding: '11px 12px', fontSize: 14, color: C.dk1, outline: 'none', background: C.lt2 }}
             />
           </div>
-        </div>
-        <label style={{ display: 'block', fontSize: 11, letterSpacing: '.08em', textTransform: 'uppercase', color: C.greyFooter, fontWeight: 700, margin: '16px 0 8px' }}>
-          Farbe
-        </label>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-          {PALETTE.map((c) => (
-            <button
-              key={c}
-              type="button"
-              onClick={() => onSetDraft('draftColor', c)}
-              style={{ width: 30, height: 30, background: c, outline: s.draftColor === c ? '3px solid #0E1721' : '1px solid rgba(0,0,0,.08)', outlineOffset: -1 }}
-            />
-          ))}
         </div>
         <button
           type="button"

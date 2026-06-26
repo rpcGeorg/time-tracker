@@ -97,3 +97,22 @@ create policy "todos are owned"
   for all
   using (user_id = auth.uid())
   with check (user_id = auth.uid());
+
+-- ============================ realtime ============================
+-- Live-Sync zwischen Geräten: die Tabellen in die Realtime-Publication
+-- aufnehmen, damit Änderungen sofort an die anderen Sessions gepusht werden.
+-- replica identity full sorgt dafür, dass auch DELETE-Events alle Spalten
+-- (inkl. user_id) tragen, damit Filter/RLS greifen.
+alter table public.todos replica identity full;
+alter table public.projects replica identity full;
+alter table public.segments replica identity full;
+-- (Idempotent – ein erneutes Hinzufügen zur Publication wird ignoriert.)
+do $$ begin
+  alter publication supabase_realtime add table public.todos;
+exception when duplicate_object then null; end $$;
+do $$ begin
+  alter publication supabase_realtime add table public.projects;
+exception when duplicate_object then null; end $$;
+do $$ begin
+  alter publication supabase_realtime add table public.segments;
+exception when duplicate_object then null; end $$;

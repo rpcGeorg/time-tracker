@@ -204,6 +204,10 @@ export default function App() {
   const [recovery, setRecovery] = useState(false);
   const [dataLoaded, setDataLoaded] = useState(!isSupabaseConfigured);
   const lastSyncRef = useRef('');
+  // always-current snapshot + a stable handle to the latest cloud-reload fn, so
+  // realtime/focus listeners (registered once) never act on stale closures.
+  const stateRef = useRef<AppState | null>(null);
+  const reloadRef = useRef<() => void>(() => {});
 
   // Archive (completed tasks) time-slice filter (Woche/Monat/Jahr).
   const [archivePeriod, setArchivePeriod] = useState<ReportPeriod>('monat');
@@ -312,6 +316,76 @@ export default function App() {
     }, 1200);
     return () => clearTimeout(t);
   }, [state.projects, state.segments, state.todos, userEmail, dataLoaded]);
+
+  // ---------- live sync (pull) ----------
+  // Re-read the cloud data and apply it – but only when there are no unsynced
+  // local edits (otherwise we'd clobber what the user just typed). Aborts on any
+  // load error so a hiccup never wipes local data.
+  stateRef.current = state;
+  async function reloadFromCloud() {
+    if (!isSupabaseConfigured || !supabase || !userEmail || !dataLoaded) return;
+    const cur = stateRef.current;
+    if (!cur) return;
+    // pending local edits → don't overwrite; the next event/focus reconciles
+    if (dataSignature(cur.projects, cur.segments, cur.todos) !== lastSyncRef.current) return;
+    try {
+      const projects = await loadProjects();
+      const segments = await loadSegments(localISODate());
+      const todos = await loadTodos();
+      const remoteSig = dataSignature(projects, segments, todos);
+      if (remoteSig === lastSyncRef.current) return; // nothing new
+      setStateRaw((prev) => {
+        // re-check the snapshot is still clean (no edit slipped in during the fetch)
+        if (dataSignature(prev.projects, prev.segments, prev.todos) !== lastSyncRef.current) return prev;
+        return { ...prev, projects, segments, todos };
+      });
+      lastSyncRef.current = remoteSig;
+    } catch (e) {
+      console.error('Cloud reload failed', e);
+    }
+  }
+  reloadRef.current = reloadFromCloud;
+
+  // Realtime: refresh as soon as any of this user's rows change on another device.
+  useEffect(() => {
+    if (!isSupabaseConfigured || !supabase || !userEmail || !dataLoaded) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const schedule = () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => { if (!cancelled) reloadRef.current(); }, 400);
+    };
+    let channel: ReturnType<NonNullable<typeof supabase>['channel']> | null = null;
+    (async () => {
+      const { data } = await supabase!.auth.getUser();
+      const uid = data.user?.id;
+      if (!uid || cancelled) return;
+      channel = supabase!
+        .channel('rt-sync')
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'todos', filter: `user_id=eq.${uid}` }, schedule)
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'projects', filter: `user_id=eq.${uid}` }, schedule)
+        .on('postgres_changes', { event: '*', schema: 'public', table: 'segments', filter: `user_id=eq.${uid}` }, schedule)
+        .subscribe();
+    })();
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      if (channel && supabase) supabase.removeChannel(channel);
+    };
+  }, [userEmail, dataLoaded]);
+
+  // Fallback: also refresh when the app regains focus / becomes visible.
+  useEffect(() => {
+    if (!isSupabaseConfigured) return;
+    const onFocus = () => reloadRef.current();
+    const onVisible = () => { if (document.visibilityState === 'visible') reloadRef.current(); };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, []);
 
   async function logout() {
     if (supabase) await supabase.auth.signOut();

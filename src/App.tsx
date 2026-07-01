@@ -1191,8 +1191,10 @@ function DailyTasksView(props: {
     const va = keyVal[sortKey](a);
     const vb = keyVal[sortKey](b);
     let r = va < vb ? -1 : va > vb ? 1 : 0;
-    if (r === 0) r = a.urgency + a.importance - (b.urgency + b.importance); // stable tiebreak
-    return sortDir === 'asc' ? r : -r;
+    r = sortDir === 'asc' ? r : -r;
+    // gleicher Sortierwert (z. B. gleiche Priorität) → geplante Dauer aufsteigend
+    if (r === 0) r = a.plannedMin - b.plannedMin;
+    return r;
   };
 
   function clickSort(k: TaskSortKey) {
